@@ -163,6 +163,12 @@ impl UnifiedExecProcessManager {
             .workdir
             .clone()
             .unwrap_or_else(|| context.turn.cwd.clone());
+
+        #[cfg(target_os = "ios")]
+        {
+            return self.exec_command_ios(&request, cwd, context).await;
+        }
+
         let process = self
             .open_session_with_sandbox(&request, cwd.clone(), context)
             .await;
@@ -292,6 +298,85 @@ impl UnifiedExecProcessManager {
         };
 
         Ok(response)
+    }
+
+    #[cfg(target_os = "ios")]
+    async fn exec_command_ios(
+        &self,
+        request: &ExecCommandRequest,
+        cwd: PathBuf,
+        context: &UnifiedExecContext,
+    ) -> Result<UnifiedExecResponse, UnifiedExecError> {
+        use crate::exec::IOS_EXEC_HOOK;
+        use crate::exec_env::create_env;
+
+        let env = create_env(
+            &context.turn.shell_environment_policy,
+            Some(context.session.conversation_id),
+        );
+
+        let event_ctx = ToolEventCtx::new(
+            context.session.as_ref(),
+            context.turn.as_ref(),
+            &context.call_id,
+            None,
+        );
+        let emitter = ToolEmitter::unified_exec(
+            &request.command,
+            cwd.clone(),
+            ExecCommandSource::UnifiedExecStartup,
+            Some(request.process_id.clone()),
+        );
+        emitter.emit(event_ctx, ToolEventStage::Begin).await;
+
+        let start = Instant::now();
+        let (exit_code, raw_output) = tokio::task::spawn_blocking({
+            let command = request.command.clone();
+            let cwd = cwd.clone();
+            move || {
+                IOS_EXEC_HOOK
+                    .get()
+                    .map(|f| f(&command, &cwd, &env))
+                    .unwrap_or((-1, b"no iOS exec hook registered\n".to_vec()))
+            }
+        })
+        .await
+        .unwrap_or((-1, b"spawn_blocking panicked\n".to_vec()));
+        let wall_time = Instant::now().saturating_duration_since(start);
+
+        let text = String::from_utf8_lossy(&raw_output).to_string();
+        let max_tokens = resolve_max_tokens(request.max_output_tokens);
+        let output = formatted_truncate_text(&text, TruncationPolicy::Tokens(max_tokens));
+
+        let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
+        emit_exec_end_for_unified_exec(
+            Arc::clone(&context.session),
+            Arc::clone(&context.turn),
+            context.call_id.clone(),
+            request.command.clone(),
+            cwd,
+            Some(request.process_id.clone()),
+            transcript,
+            output.clone(),
+            exit_code,
+            wall_time,
+        )
+        .await;
+
+        self.release_process_id(&request.process_id).await;
+
+        let original_token_count = approx_token_count(&text);
+        Ok(UnifiedExecResponse {
+            event_call_id: context.call_id.clone(),
+            chunk_id: generate_chunk_id(),
+            wall_time,
+            output,
+            raw_output,
+            process_id: None,
+            exit_code: Some(exit_code),
+            original_token_count: Some(original_token_count),
+            session_command: Some(request.command.clone()),
+        })
     }
 
     pub(crate) async fn write_stdin(

@@ -1,5 +1,21 @@
 # Rust/codex-rs
 
+## External Pi runtime prototype (fork-only)
+
+The `codex-pi/external-runtime-contract` branch adds a runtime-provider boundary that runs Pi SDK agents as native Codex child threads. The paired TypeScript sidecar lives in the `shuv1337/pi-mono` fork under `packages/codex-runtime`; its protobuf contract is duplicated at `codex-rs/ext/pi-runtime/proto/pi_codex_runtime.proto` and must evolve in lockstep.
+
+Preserve these invariants when merging upstream Codex:
+
+- The reserved model-visible `collaboration.spawn_agent` schema stays exact. External roles are selected only through the separate `runtime_agents.spawn_agent` tool.
+- `ManagedAgentThread` remains the common native/external capability boundary. Shared lifecycle, residency, communication, completion, history, and resume paths must not regain concrete `CodexThread` assumptions.
+- Pi built-in tools remain disabled. External filesystem, process, network, approval, patch/diff, output-streaming, and cancellation work executes through Codex-hosted tool handlers.
+- Persisted external history retains runtime ID, real provider/model, parent edge, native items, token usage, and the opaque Pi session locator; resume dispatches that locator through the owning runtime provider.
+- Desktop and app-server clients continue consuming ordinary Codex thread/turn/item/status events rather than a Pi-specific UI protocol.
+
+The highest-conflict upstream surfaces are `codex-rs/core/src/thread_manager.rs`, `codex-rs/core/src/agent/control/spawn.rs`, `codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs`, `codex-rs/core/src/tools/spec_plan.rs`, and app-server thread/turn lifecycle handling. Resolve conflicts by reapplying the capability and persistence invariants to upstream's current structure; do not take an entire conflict side mechanically.
+
+After an upstream merge, run the exact reserved-schema regression before broader tests, then the runtime registry, managed-thread lifecycle, cold-resume, real-sidecar spawn/resume, host-policy app-server, and durable-history cases. Build/install candidates with `--no-restart` first and perform any shared Desktop app-server restart externally, never from the Codex session it serves.
+
 In the codex-rs folder where the rust code lives:
 
 - Crate names are prefixed with `codex-`. For example, the `core` folder's crate is named `codex-core`

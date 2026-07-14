@@ -43,6 +43,15 @@ pub const DEFAULT_ORIGINATOR: &str = "codex_cli_rs";
 pub const CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR: &str = "CODEX_INTERNAL_ORIGINATOR_OVERRIDE";
 pub const RESIDENCY_HEADER_NAME: &str = "x-openai-internal-codex-residency";
 
+/// Overrides the build-version segment of the Codex User-Agent (and therefore
+/// `appServerVersion`/`cliVersion` as parsed by app-server-daemon clients) without
+/// changing the compiled `CARGO_PKG_VERSION`. Intended for compat shims (e.g. dev/fork
+/// builds installed in place of a stock Desktop-bundled Codex release) that need the
+/// *real* protocol-level version identification to match a genuine release version,
+/// not just the output of `--version`/`app-server daemon version`, which callers can
+/// already spoof at the shell layer. Unset in ordinary builds/installs.
+pub const CODEX_USER_AGENT_VERSION_OVERRIDE_ENV_VAR: &str = "CODEX_USER_AGENT_VERSION_OVERRIDE";
+
 pub use codex_config::ResidencyRequirement;
 
 #[derive(Debug, Clone)]
@@ -138,8 +147,26 @@ pub fn is_first_party_chat_originator(originator_value: &str) -> bool {
     originator_value == "codex_atlas" || originator_value == "codex_chatgpt_desktop"
 }
 
+fn codex_user_agent_build_version() -> std::borrow::Cow<'static, str> {
+    codex_user_agent_build_version_with_override(
+        std::env::var(CODEX_USER_AGENT_VERSION_OVERRIDE_ENV_VAR).ok(),
+    )
+}
+
+/// Pure helper split out of [`codex_user_agent_build_version`] so tests can exercise the
+/// override precedence without mutating (racily, across parallel tests in this binary)
+/// the real process environment.
+fn codex_user_agent_build_version_with_override(
+    override_value: Option<String>,
+) -> std::borrow::Cow<'static, str> {
+    match override_value {
+        Some(value) if !value.trim().is_empty() => std::borrow::Cow::Owned(value),
+        _ => std::borrow::Cow::Borrowed(env!("CARGO_PKG_VERSION")),
+    }
+}
+
 pub fn get_codex_user_agent() -> String {
-    let build_version = env!("CARGO_PKG_VERSION");
+    let build_version = codex_user_agent_build_version();
     let os_info = os_info::get();
     let originator = originator();
     let prefix = format!(

@@ -47,6 +47,40 @@ fn test_get_codex_user_agent() {
 }
 
 #[test]
+fn user_agent_build_version_defaults_to_compiled_package_version() {
+    assert_eq!(
+        codex_user_agent_build_version_with_override(None),
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+#[test]
+fn user_agent_build_version_honors_non_empty_override() {
+    // This is the mechanism a Desktop-installed compat shim uses to make the *real*
+    // protocol-level User-Agent (parsed into `appServerVersion` by app-server-daemon
+    // clients, which the remote-control/mobile pairing backend keys compatibility on)
+    // match a genuine release version, even when CARGO_PKG_VERSION is a dev marker
+    // like "0.0.0". Spoofing only `--version`/`app-server daemon version` output is not
+    // sufficient because those are separate code paths from this one.
+    assert_eq!(
+        codex_user_agent_build_version_with_override(Some("0.144.0".to_string())),
+        "0.144.0"
+    );
+}
+
+#[test]
+fn user_agent_build_version_ignores_blank_override() {
+    assert_eq!(
+        codex_user_agent_build_version_with_override(Some("   ".to_string())),
+        env!("CARGO_PKG_VERSION")
+    );
+    assert_eq!(
+        codex_user_agent_build_version_with_override(Some(String::new())),
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+#[test]
 fn is_first_party_originator_matches_known_values() {
     assert_eq!(is_first_party_originator(DEFAULT_ORIGINATOR), true);
     assert_eq!(is_first_party_originator("codex-tui"), true);

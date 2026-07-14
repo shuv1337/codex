@@ -46,6 +46,7 @@ mod environment_selection;
 pub mod exec;
 pub mod exec_env;
 mod exec_policy;
+mod external_host_tools;
 #[cfg(test)]
 mod git_info_tests;
 mod guardian;
@@ -54,6 +55,8 @@ mod image_preparation;
 mod installation_id;
 pub(crate) mod landlock;
 pub use landlock::spawn_command_under_linux_sandbox;
+mod managed_agent_thread;
+pub use managed_agent_thread::ManagedAgentThread;
 pub(crate) mod mcp;
 mod mcp_skill_dependencies;
 mod mcp_tool_approval_templates;

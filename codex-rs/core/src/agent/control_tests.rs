@@ -1,5 +1,6 @@
 use super::*;
 use crate::CodexThread;
+use crate::ManagedAgentThread;
 use crate::StateDbHandle;
 use crate::ThreadManager;
 use crate::agent::agent_status_from_event;
@@ -13,6 +14,14 @@ use crate::context::SubagentNotification;
 use crate::init_state_db;
 use crate::thread_manager::StartThreadOptions;
 use assert_matches::assert_matches;
+use codex_extension_api::AgentRuntimeFuture;
+use codex_extension_api::AgentRuntimeId;
+use codex_extension_api::AgentRuntimeOperation;
+use codex_extension_api::AgentRuntimePersistence;
+use codex_extension_api::AgentRuntimeProvider;
+use codex_extension_api::AgentRuntimeResumeRequest;
+use codex_extension_api::AgentRuntimeSpawnRequest;
+use codex_extension_api::AgentRuntimeThread;
 use codex_extension_api::ExtensionDataInit;
 use codex_extension_api::empty_extension_registry;
 use codex_features::Feature;
@@ -28,12 +37,14 @@ use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::ErrorEvent;
+use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
@@ -119,6 +130,157 @@ struct AgentControlHarness {
     control: AgentControl,
 }
 
+struct ScriptedExternalThread {
+    thread_id: ThreadId,
+    runtime_id: AgentRuntimeId,
+    events: std::sync::Mutex<VecDeque<Event>>,
+    operations: std::sync::Mutex<Vec<AgentRuntimeOperation>>,
+}
+
+impl AgentRuntimeThread for ScriptedExternalThread {
+    fn thread_id(&self) -> ThreadId {
+        self.thread_id
+    }
+
+    fn runtime_id(&self) -> &AgentRuntimeId {
+        &self.runtime_id
+    }
+
+    fn submit(&self, operation: AgentRuntimeOperation) -> AgentRuntimeFuture<'_, ()> {
+        Box::pin(async move {
+            self.operations
+                .lock()
+                .expect("external operations lock")
+                .push(operation);
+            Ok(())
+        })
+    }
+
+    fn next_event(&self) -> AgentRuntimeFuture<'_, Option<Event>> {
+        Box::pin(async move {
+            Ok(self
+                .events
+                .lock()
+                .expect("external events lock")
+                .pop_front())
+        })
+    }
+
+    fn status(&self) -> AgentRuntimeFuture<'_, AgentStatus> {
+        Box::pin(async { Ok(AgentStatus::PendingInit) })
+    }
+
+    fn token_usage(&self) -> AgentRuntimeFuture<'_, Option<TokenUsageInfo>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn persistence(&self) -> AgentRuntimeFuture<'_, AgentRuntimePersistence> {
+        Box::pin(async move {
+            Ok(AgentRuntimePersistence {
+                runtime_id: self.runtime_id.clone(),
+                session_locator: self.thread_id.to_string(),
+                metadata: serde_json::json!({}),
+            })
+        })
+    }
+
+    fn shutdown(&self) -> AgentRuntimeFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+struct ScriptedExternalProvider {
+    runtime_id: AgentRuntimeId,
+    requests: std::sync::Mutex<Vec<AgentRuntimeSpawnRequest>>,
+    resume_requests: std::sync::Mutex<Vec<AgentRuntimeResumeRequest>>,
+    last_thread: std::sync::Mutex<Option<Arc<ScriptedExternalThread>>>,
+}
+
+impl ScriptedExternalProvider {
+    fn new(runtime_id: &str) -> Self {
+        Self {
+            runtime_id: AgentRuntimeId::new(runtime_id).expect("valid external runtime id"),
+            requests: std::sync::Mutex::new(Vec::new()),
+            resume_requests: std::sync::Mutex::new(Vec::new()),
+            last_thread: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn scripted_thread(
+        &self,
+        thread_id: ThreadId,
+        turn_id: &str,
+        final_message: &str,
+    ) -> Arc<ScriptedExternalThread> {
+        Arc::new(ScriptedExternalThread {
+            thread_id,
+            runtime_id: self.runtime_id.clone(),
+            events: std::sync::Mutex::new(
+                vec![
+                    Event {
+                        id: turn_id.to_string(),
+                        msg: EventMsg::TurnStarted(TurnStartedEvent {
+                            turn_id: turn_id.to_string(),
+                            trace_id: None,
+                            started_at: None,
+                            model_context_window: None,
+                            collaboration_mode_kind: ModeKind::Default,
+                        }),
+                    },
+                    Event {
+                        id: turn_id.to_string(),
+                        msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                            turn_id: turn_id.to_string(),
+                            last_agent_message: Some(final_message.to_string()),
+                            error: None,
+                            started_at: None,
+                            completed_at: None,
+                            duration_ms: None,
+                            time_to_first_token_ms: None,
+                        }),
+                    },
+                ]
+                .into(),
+            ),
+            operations: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+}
+
+impl AgentRuntimeProvider for ScriptedExternalProvider {
+    fn id(&self) -> &AgentRuntimeId {
+        &self.runtime_id
+    }
+
+    fn spawn(
+        &self,
+        request: AgentRuntimeSpawnRequest,
+    ) -> AgentRuntimeFuture<'_, Arc<dyn AgentRuntimeThread>> {
+        let thread = self.scripted_thread(request.thread_id, "turn-1", "external done");
+        self.requests
+            .lock()
+            .expect("external requests lock")
+            .push(request);
+        *self.last_thread.lock().expect("external thread lock") = Some(Arc::clone(&thread));
+        let runtime: Arc<dyn AgentRuntimeThread> = thread;
+        Box::pin(async move { Ok(runtime) })
+    }
+
+    fn resume(
+        &self,
+        request: AgentRuntimeResumeRequest,
+    ) -> AgentRuntimeFuture<'_, Arc<dyn AgentRuntimeThread>> {
+        let thread = self.scripted_thread(request.thread_id, "turn-2", "external resumed");
+        self.resume_requests
+            .lock()
+            .expect("external resume requests lock")
+            .push(request);
+        *self.last_thread.lock().expect("external thread lock") = Some(Arc::clone(&thread));
+        let runtime: Arc<dyn AgentRuntimeThread> = thread;
+        Box::pin(async move { Ok(runtime) })
+    }
+}
+
 impl AgentControlHarness {
     async fn new() -> Self {
         let (home, config) = test_config().await;
@@ -173,6 +335,8 @@ async fn persisted_originator(thread: &CodexThread) -> String {
         .find_map(|item| match item {
             RolloutItem::SessionMeta(meta_line) => Some(meta_line.meta.originator.clone()),
             RolloutItem::ResponseItem(_)
+            | RolloutItem::ExternalRuntimeItem(_)
+            | RolloutItem::ExternalRuntimeState(_)
             | RolloutItem::InterAgentCommunication(_)
             | RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::EventMsg(_)
@@ -259,6 +423,21 @@ async fn wait_for_subagent_notification(parent_thread: &Arc<CodexThread>) -> boo
     timeout(Duration::from_secs(10), wait).await.is_ok()
 }
 
+async fn next_external_turn_event(thread: &Arc<ManagedAgentThread>, completed: bool) -> EventMsg {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let event = thread.next_event().await.expect("external runtime event");
+            if matches!((&event.msg, completed), (EventMsg::TurnStarted(_), false))
+                || matches!((&event.msg, completed), (EventMsg::TurnComplete(_), true))
+            {
+                return event.msg;
+            }
+        }
+    })
+    .await
+    .expect("external turn event should arrive")
+}
+
 async fn persist_thread_for_tree_resume(thread: &Arc<CodexThread>, message: &str) {
     thread
         .inject_user_message_without_turn(message.to_string())
@@ -332,6 +511,352 @@ async fn get_status_returns_not_found_without_manager() {
     let control = AgentControl::default();
     let got = control.get_status(ThreadId::new()).await;
     assert_eq!(got, AgentStatus::NotFound);
+}
+
+#[tokio::test]
+async fn external_runtime_spawns_managed_child_and_supports_lifecycle_operations() {
+    let mut harness = AgentControlHarness::new().await;
+    harness.config.agent_roles.insert(
+        "external-worker".to_string(),
+        AgentRoleConfig {
+            description: Some("Scripted external worker".to_string()),
+            config_file: None,
+            nickname_candidates: Some(vec!["External".to_string()]),
+            runtime: Some("fake".to_string()),
+            runtime_config: None,
+        },
+    );
+    let provider = Arc::new(ScriptedExternalProvider::new("fake"));
+    let provider_trait: Arc<dyn AgentRuntimeProvider> = provider.clone();
+    harness
+        .manager
+        .register_agent_runtime_provider(provider_trait)
+        .expect("register external runtime");
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+    let parent_turn = parent_thread.codex.session.new_default_turn().await;
+    let environments = parent_turn.environments.to_selections();
+    assert!(!environments.is_empty());
+
+    let child_thread_id = harness
+        .control
+        .spawn_agent_with_metadata(
+            harness.config.clone(),
+            text_input("run externally"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: Some("external-worker".to_string()),
+            })),
+            SpawnAgentOptions {
+                parent_thread_id: Some(parent_thread_id),
+                environments: Some(environments),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("spawn external child")
+        .thread_id;
+
+    let requests = provider.requests.lock().expect("external requests lock");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].thread_id, child_thread_id);
+    assert_eq!(requests[0].parent_thread_id, Some(parent_thread_id));
+    assert_eq!(requests[0].role.as_deref(), Some("external-worker"));
+    let mut host_tool_names = requests[0]
+        .host_tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    host_tool_names.sort_unstable();
+    assert_eq!(host_tool_names, ["apply_patch", "exec_command"]);
+    drop(requests);
+
+    let state = harness.control.upgrade().expect("thread manager state");
+    let child = state
+        .get_thread(child_thread_id)
+        .await
+        .expect("managed external child");
+    assert_eq!(child.thread_id(), child_thread_id);
+    assert!(child.as_codex_thread().is_none());
+    assert_eq!(
+        child.session_configured().parent_thread_id,
+        Some(parent_thread_id)
+    );
+    assert_eq!(child.token_usage_info().await.expect("token usage"), None);
+    match harness.manager.get_thread(child_thread_id).await {
+        Err(CodexErr::UnsupportedOperation(_)) => {}
+        Err(error) => panic!("expected unsupported external native access, got {error}"),
+        Ok(_) => panic!("external child unexpectedly exposed as a CodexThread"),
+    }
+
+    let runtime = provider
+        .last_thread
+        .lock()
+        .expect("external thread lock")
+        .clone()
+        .expect("spawned external runtime thread");
+    let operations = runtime.operations.lock().expect("external operations lock");
+    assert_eq!(operations.len(), 1);
+    assert_matches!(&operations[0].op, Op::UserInput { .. });
+    drop(operations);
+
+    assert_matches!(
+        next_external_turn_event(&child, false).await,
+        EventMsg::TurnStarted(_)
+    );
+    assert_eq!(child.agent_status().await, AgentStatus::Running);
+    assert_matches!(
+        next_external_turn_event(&child, true).await,
+        EventMsg::TurnComplete(_)
+    );
+    assert_eq!(
+        child.agent_status().await,
+        AgentStatus::Completed(Some("external done".to_string()))
+    );
+
+    harness
+        .control
+        .interrupt_agent(child_thread_id)
+        .await
+        .expect("interrupt external child");
+    harness
+        .control
+        .shutdown_live_agent(child_thread_id)
+        .await
+        .expect("shutdown external child");
+    let operations = runtime.operations.lock().expect("external operations lock");
+    assert_matches!(&operations[1].op, Op::Interrupt);
+    assert_matches!(&operations[2].op, Op::Shutdown { .. });
+    assert_eq!(child.agent_status().await, AgentStatus::Shutdown);
+    match state.get_thread(child_thread_id).await {
+        Err(CodexErr::ThreadNotFound(id)) => assert_eq!(id, child_thread_id),
+        Err(error) => panic!("expected removed external child, got {error}"),
+        Ok(_) => panic!("external child remained loaded after shutdown"),
+    }
+}
+
+#[tokio::test]
+async fn multi_agent_v2_external_runtime_completion_queues_parent_message() {
+    let mut harness = AgentControlHarness::new().await;
+    let _ = harness.config.features.enable(Feature::MultiAgentV2);
+    harness.config.agent_roles.insert(
+        "external-worker".to_string(),
+        AgentRoleConfig {
+            description: Some("Scripted external worker".to_string()),
+            config_file: None,
+            nickname_candidates: Some(vec!["External".to_string()]),
+            runtime: Some("fake".to_string()),
+            runtime_config: None,
+        },
+    );
+    let provider = Arc::new(ScriptedExternalProvider::new("fake"));
+    let provider_trait: Arc<dyn AgentRuntimeProvider> = provider;
+    harness
+        .manager
+        .register_agent_runtime_provider(provider_trait)
+        .expect("register external runtime");
+    let (parent_thread_id, _parent_thread) = harness.start_thread().await;
+    let child_path = AgentPath::try_from("/root/external").expect("child path");
+    let spawned = harness
+        .control
+        .spawn_agent_with_metadata(
+            harness.config.clone(),
+            text_input("run externally"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: Some(child_path.clone()),
+                agent_nickname: Some("External".to_string()),
+                agent_role: Some("external-worker".to_string()),
+            })),
+            SpawnAgentOptions {
+                parent_thread_id: Some(parent_thread_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("spawn external child");
+    let child = harness
+        .manager
+        .get_managed_thread(spawned.thread_id)
+        .await
+        .expect("managed external child");
+
+    assert_matches!(
+        next_external_turn_event(&child, false).await,
+        EventMsg::TurnStarted(_)
+    );
+    assert_matches!(
+        next_external_turn_event(&child, true).await,
+        EventMsg::TurnComplete(_)
+    );
+
+    let message = crate::session_prefix::format_inter_agent_completion_message(
+        AgentPath::root(),
+        child_path.clone(),
+        &AgentStatus::Completed(Some("external done".to_string())),
+    )
+    .expect("completed status should render");
+    let expected = (
+        parent_thread_id,
+        Op::InterAgentCommunication {
+            communication: InterAgentCommunication::new(
+                child_path,
+                AgentPath::root(),
+                Vec::new(),
+                message,
+                /*trigger_turn*/ false,
+            ),
+        },
+    );
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if harness
+                .manager
+                .captured_ops()
+                .into_iter()
+                .any(|entry| entry == expected)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("external completion should queue a direct-parent message");
+}
+
+#[tokio::test]
+async fn ensure_v2_agent_loaded_cold_resumes_external_runtime_from_persisted_state() {
+    Box::pin(run_external_runtime_cold_resume_test()).await;
+}
+
+async fn run_external_runtime_cold_resume_test() {
+    let (home, mut config) = test_config().await;
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    let _ = config.features.enable(Feature::Sqlite);
+    config.agent_roles.insert(
+        "external-worker".to_string(),
+        AgentRoleConfig {
+            description: Some("Scripted external worker".to_string()),
+            config_file: None,
+            nickname_candidates: Some(vec!["External".to_string()]),
+            runtime: Some("fake".to_string()),
+            runtime_config: None,
+        },
+    );
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let provider = Arc::new(ScriptedExternalProvider::new("fake"));
+    let provider_trait: Arc<dyn AgentRuntimeProvider> = provider.clone();
+    harness
+        .manager
+        .register_agent_runtime_provider(provider_trait)
+        .expect("register external runtime");
+    let (parent_thread_id, _parent_thread) = harness.start_thread().await;
+    let agent_path = AgentPath::try_from("/root/external").expect("agent path");
+    let spawned_agent = harness
+        .control
+        .spawn_agent_with_metadata(
+            harness.config.clone(),
+            text_input("run externally"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: Some(agent_path),
+                agent_nickname: Some("External".to_string()),
+                agent_role: Some("external-worker".to_string()),
+            })),
+            SpawnAgentOptions {
+                parent_thread_id: Some(parent_thread_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("spawn external child");
+    let child = harness
+        .manager
+        .get_managed_thread(spawned_agent.thread_id)
+        .await
+        .expect("managed external child");
+    assert_matches!(
+        next_external_turn_event(&child, false).await,
+        EventMsg::TurnStarted(_)
+    );
+    assert_matches!(
+        next_external_turn_event(&child, true).await,
+        EventMsg::TurnComplete(_)
+    );
+    child
+        .shutdown_and_wait()
+        .await
+        .expect("external child should close its live persistence writer");
+
+    assert!(
+        harness
+            .manager
+            .remove_managed_thread(&spawned_agent.thread_id)
+            .await
+            .is_some()
+    );
+    drop(child);
+    harness
+        .control
+        .ensure_v2_agent_loaded(harness.config.clone(), spawned_agent.thread_id)
+        .await
+        .expect("persisted external child should cold resume");
+
+    let resume_requests = provider
+        .resume_requests
+        .lock()
+        .expect("external resume requests lock");
+    assert_eq!(resume_requests.len(), 1);
+    assert_eq!(resume_requests[0].thread_id, spawned_agent.thread_id);
+    assert_eq!(resume_requests[0].parent_thread_id, Some(parent_thread_id));
+    assert_eq!(resume_requests[0].state.runtime_id.as_str(), "fake");
+    assert_eq!(
+        resume_requests[0].state.session_locator,
+        spawned_agent.thread_id.to_string()
+    );
+    drop(resume_requests);
+
+    let resumed = harness
+        .manager
+        .get_managed_thread(spawned_agent.thread_id)
+        .await
+        .expect("resumed external child");
+    assert!(resumed.as_codex_thread().is_none());
+    harness
+        .control
+        .send_input(spawned_agent.thread_id, text_input("continue externally"))
+        .await
+        .expect("resumed external child accepts input");
+    let resumed_runtime = provider
+        .last_thread
+        .lock()
+        .expect("external thread lock")
+        .clone()
+        .expect("resumed external runtime thread");
+    let operations = resumed_runtime
+        .operations
+        .lock()
+        .expect("external operations lock");
+    assert_eq!(operations.len(), 1);
+    assert_matches!(&operations[0].op, Op::UserInput { .. });
+    drop(operations);
+    assert_matches!(
+        next_external_turn_event(&resumed, false).await,
+        EventMsg::TurnStarted(_)
+    );
+    assert_matches!(
+        next_external_turn_event(&resumed, true).await,
+        EventMsg::TurnComplete(_)
+    );
+    assert_eq!(
+        resumed.agent_status().await,
+        AgentStatus::Completed(Some("external resumed".to_string()))
+    );
 }
 
 #[tokio::test]
@@ -2354,6 +2879,8 @@ async fn spawn_thread_subagent_uses_role_specific_nickname_candidates() {
             description: Some("Research role".to_string()),
             config_file: None,
             nickname_candidates: Some(vec!["Atlas".to_string()]),
+            runtime: None,
+            runtime_config: None,
         },
     );
     let (parent_thread_id, _parent_thread) = harness.start_thread().await;

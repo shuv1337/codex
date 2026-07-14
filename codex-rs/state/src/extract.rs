@@ -19,6 +19,7 @@ pub fn apply_rollout_item(
 ) {
     match item {
         RolloutItem::SessionMeta(meta_line) => apply_session_meta_from_item(metadata, meta_line),
+        RolloutItem::ExternalRuntimeState(_) | RolloutItem::ExternalRuntimeItem(_) => {}
         RolloutItem::TurnContext(turn_ctx) => apply_turn_context(metadata, turn_ctx),
         RolloutItem::EventMsg(event) => apply_event_msg(metadata, event),
         RolloutItem::ResponseItem(item) => apply_response_item(metadata, item),
@@ -45,6 +46,8 @@ pub fn rollout_item_affects_thread_metadata(item: &RolloutItem) -> bool {
             true
         }
         RolloutItem::EventMsg(_)
+        | RolloutItem::ExternalRuntimeItem(_)
+        | RolloutItem::ExternalRuntimeState(_)
         | RolloutItem::ResponseItem(_)
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }

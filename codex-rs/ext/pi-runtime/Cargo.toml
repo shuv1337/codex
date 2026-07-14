@@ -1,0 +1,28 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "codex-pi-runtime"
+version.workspace = true
+
+[lib]
+name = "codex_pi_runtime"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+codex-extension-api = { workspace = true }
+codex-protocol = { workspace = true }
+prost = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "net", "process", "sync", "time"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+codex-utils-absolute-path = { workspace = true }
+pretty_assertions = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

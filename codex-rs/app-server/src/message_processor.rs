@@ -298,6 +298,26 @@ impl MessageProcessor {
                 )),
             )
         });
+        #[cfg(debug_assertions)]
+        if std::env::var_os(crate::fake_agent_runtime::ENABLE_FAKE_AGENT_RUNTIME_ENV).is_some() {
+            thread_manager
+                .register_agent_runtime_provider(Arc::new(
+                    crate::fake_agent_runtime::FakeAgentRuntimeProvider::new(),
+                ))
+                .expect("debug fake agent runtime should register once");
+        }
+        match codex_pi_runtime::PiRuntimeProvider::from_environment() {
+            Ok(Some(provider)) => {
+                thread_manager
+                    .register_agent_runtime_provider(Arc::new(provider))
+                    .expect("Pi agent runtime should register once");
+                tracing::info!("registered Pi agent runtime provider");
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(error = %error, "failed to configure Pi agent runtime provider");
+            }
+        }
         let models_manager = thread_manager.get_models_manager();
         let models_refresh_worker =
             crate::models_refresh_worker::spawn(&models_manager, config.http_client_factory());

@@ -19,6 +19,7 @@ use codex_config::ConfigLayerStackOrdering;
 use codex_config::config_toml::ConfigToml;
 use codex_config::loader::resolve_relative_paths_in_config_toml;
 use codex_exec_server::LOCAL_FS;
+use codex_extension_api::AgentRuntimeId;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -124,6 +125,21 @@ pub(crate) fn resolve_role_config<'a>(
         .agent_roles
         .get(role_name)
         .or_else(|| built_in::configs().get(role_name))
+}
+
+pub(crate) fn resolve_role_runtime_id(
+    config: &Config,
+    role_name: Option<&str>,
+) -> Result<AgentRuntimeId, String> {
+    let role_name = role_name.unwrap_or(DEFAULT_ROLE_NAME);
+    let role = resolve_role_config(config, role_name)
+        .ok_or_else(|| format!("unknown agent_type '{role_name}'"))?;
+    role.runtime
+        .as_deref()
+        .map(AgentRuntimeId::new)
+        .transpose()
+        .map(|runtime| runtime.unwrap_or_else(AgentRuntimeId::codex))
+        .map_err(|err| err.to_string())
 }
 
 mod reload {
@@ -315,6 +331,8 @@ mod built_in {
                         description: Some("Default agent.".to_string()),
                         config_file: None,
                         nickname_candidates: None,
+                        runtime: None,
+                        runtime_config: None,
                     }
                 ),
                 (
@@ -329,6 +347,8 @@ Rules:
 - Reuse existing explorers for related questions."#.to_string()),
                         config_file: Some("explorer.toml".to_string().parse().unwrap_or_default()),
                         nickname_candidates: None,
+                        runtime: None,
+                        runtime_config: None,
                     }
                 ),
                 (
@@ -344,6 +364,8 @@ Rules:
 - Always tell workers they are **not alone in the codebase**, and they should not revert the edits made by others, and they should adjust their implementation to accommodate the changes made by others. This is important because there may be multiple workers making changes in parallel, and they need to be aware of each other's work to avoid conflicts and ensure a cohesive final product."#.to_string()),
                         config_file: None,
                         nickname_candidates: None,
+                        runtime: None,
+                        runtime_config: None,
                     }
                 ),
                 // Awaiter is temp removed
@@ -362,6 +384,7 @@ Rules:
 // - Do not use an awaiter for every compilation/test if it won't take time. Only use if for long running commands.
 // - Close the awaiter when you're done with it."#.to_string()),
 //                         config_file: Some("awaiter.toml".to_string().parse().unwrap_or_default()),
+//                         runtime: None,
 //                     }
 //                 )
             ])

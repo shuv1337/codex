@@ -46,14 +46,22 @@ impl AgentControl {
         }
         let state = self.upgrade()?;
         let thread = state.get_thread(thread_id).await?;
-        if thread.codex.session.active_turn.lock().await.is_some() {
+        if thread.is_turn_active().await {
             return Ok(());
         }
-        let config = thread.codex.session.get_config().await;
-        let multi_agent_version = thread
-            .multi_agent_version()
-            .unwrap_or_else(|| config.multi_agent_version_from_features());
-        self.ensure_execution_capacity(multi_agent_version, &thread.session_source)
+        let multi_agent_version = if let Some(version) = thread.multi_agent_version() {
+            version
+        } else if let Some(codex_thread) = thread.as_codex_thread() {
+            codex_thread
+                .codex
+                .session
+                .get_config()
+                .await
+                .multi_agent_version_from_features()
+        } else {
+            MultiAgentVersion::V1
+        };
+        self.ensure_execution_capacity(multi_agent_version, thread.session_source())
     }
 
     pub(crate) fn ensure_execution_capacity(

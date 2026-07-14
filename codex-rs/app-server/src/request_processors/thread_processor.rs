@@ -915,7 +915,7 @@ impl ThreadRequestProcessor {
     async fn ensure_listener_task_running(
         &self,
         conversation_id: ThreadId,
-        conversation: Arc<CodexThread>,
+        conversation: Arc<ManagedAgentThread>,
         thread_state: Arc<Mutex<ThreadState>>,
     ) -> Result<(), JSONRPCErrorError> {
         super::thread_lifecycle::ensure_listener_task_running(
@@ -2636,13 +2636,14 @@ impl ThreadRequestProcessor {
         connection_ids: Vec<ConnectionId>,
     ) {
         let mut raw_events_enabled = false;
-        if let Ok(thread) = self.thread_manager.get_thread(thread_id).await {
+        if let Ok(thread) = self.thread_manager.get_managed_thread(thread_id).await {
             let config_snapshot = thread.config_snapshot().await;
+            let session_configured = thread.session_configured();
             let loaded_thread = build_thread_from_snapshot(
                 thread_id,
-                thread.session_configured().session_id.to_string(),
+                session_configured.session_id.to_string(),
                 &config_snapshot,
-                thread.rollout_path(),
+                session_configured.rollout_path,
             );
             self.thread_watch_manager.upsert_thread(loaded_thread).await;
             if let Some(parent_thread_id) = config_snapshot.parent_thread_id {
@@ -3134,9 +3135,14 @@ impl ThreadRequestProcessor {
                 .thread_state_manager
                 .thread_state(existing_thread_id)
                 .await;
+            let managed_thread = self
+                .thread_manager
+                .get_managed_thread(existing_thread_id)
+                .await
+                .map_err(|error| internal_error(error.to_string()))?;
             self.ensure_listener_task_running(
                 existing_thread_id,
-                existing_thread.clone(),
+                managed_thread,
                 thread_state.clone(),
             )
             .await?;

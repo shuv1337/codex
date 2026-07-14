@@ -316,6 +316,7 @@ use codex_connectors::AppInfo;
 use codex_core::CodexThread;
 use codex_core::CodexThreadSettingsOverrides;
 use codex_core::ForkSnapshot;
+use codex_core::ManagedAgentThread;
 use codex_core::McpManager;
 use codex_core::NewThread;
 #[cfg(test)]
@@ -551,6 +552,7 @@ use crate::thread_state::ThreadListenerCommand;
 use crate::thread_state::ThreadState;
 use crate::thread_state::ThreadStateManager;
 use token_usage_replay::latest_token_usage_turn_id_from_rollout_items;
+use token_usage_replay::send_managed_thread_token_usage_update_to_connection;
 use token_usage_replay::send_thread_token_usage_update_to_connection;
 
 fn resolve_request_cwd(cwd: Option<PathBuf>) -> Result<Option<AbsolutePathBuf>, JSONRPCErrorError> {

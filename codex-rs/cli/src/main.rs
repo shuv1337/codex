@@ -235,6 +235,10 @@ enum DebugSubcommand {
     /// Render the model-visible prompt input list as JSON.
     PromptInput(DebugPromptInputCommand),
 
+    /// Report the external agent runtime ABI supported by this Codex build.
+    #[clap(hide = true)]
+    ExternalAgentRuntime,
+
     /// Replay a rollout trace bundle and write reduced state JSON.
     #[clap(hide = true)]
     TraceReduce(DebugTraceReduceCommand),
@@ -1517,6 +1521,23 @@ async fn cli_main(
                     arg0_paths.clone(),
                 )
                 .await?;
+            }
+            DebugSubcommand::ExternalAgentRuntime => {
+                reject_remote_mode_for_subcommand(
+                    root_remote.as_deref(),
+                    root_remote_auth_token_env.as_deref(),
+                    "debug external-agent-runtime",
+                )?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "abiVersion": 1,
+                        "providers": ["codex", "pi"],
+                        "agentRoleDirectory": "agents",
+                        "persistence": true,
+                        "hostTools": true
+                    }))?
+                );
             }
             DebugSubcommand::TraceReduce(cmd) => {
                 reject_remote_mode_for_subcommand(

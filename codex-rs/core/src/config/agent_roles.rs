@@ -5,6 +5,7 @@ use codex_config::config_toml::AgentRoleToml;
 use codex_config::config_toml::AgentsToml;
 use codex_config::config_toml::ConfigToml;
 use codex_exec_server::ExecutorFileSystem;
+use codex_extension_api::AgentRuntimeId;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::AbsolutePathBufGuard;
 use codex_utils_path_uri::PathUri;
@@ -157,6 +158,8 @@ async fn read_declared_role(
         role_name = parsed_file.role_name;
         role.description = parsed_file.description.or(role.description);
         role.nickname_candidates = parsed_file.nickname_candidates.or(role.nickname_candidates);
+        role.runtime = parsed_file.runtime.or(role.runtime);
+        role.runtime_config = parsed_file.runtime_config.or(role.runtime_config);
     }
 
     Ok((role_name, role))
@@ -169,6 +172,11 @@ fn merge_missing_role_fields(role: &mut AgentRoleConfig, fallback: &AgentRoleCon
         .nickname_candidates
         .clone()
         .or(fallback.nickname_candidates.clone());
+    role.runtime = role.runtime.clone().or(fallback.runtime.clone());
+    role.runtime_config = role
+        .runtime_config
+        .clone()
+        .or(fallback.runtime_config.clone());
 }
 
 fn agents_toml_from_layer(
@@ -207,11 +215,17 @@ async fn agent_role_config_from_toml(
         &format!("agents.{role_name}.nickname_candidates"),
         role.nickname_candidates.as_deref(),
     )?;
+    let runtime = normalize_agent_role_runtime(
+        &format!("agents.{role_name}.runtime"),
+        role.runtime.as_deref(),
+    )?;
 
     Ok(AgentRoleConfig {
         description,
         config_file: config_file.map(AbsolutePathBuf::into_path_buf),
         nickname_candidates,
+        runtime,
+        runtime_config: role.runtime_config.clone(),
     })
 }
 
@@ -221,6 +235,8 @@ struct RawAgentRoleFileToml {
     name: Option<String>,
     description: Option<String>,
     nickname_candidates: Option<Vec<String>>,
+    runtime: Option<String>,
+    runtime_config: Option<serde_json::Value>,
     #[serde(flatten)]
     config: ConfigToml,
 }
@@ -230,6 +246,8 @@ pub(crate) struct ResolvedAgentRoleFile {
     pub(crate) role_name: String,
     pub(crate) description: Option<String>,
     pub(crate) nickname_candidates: Option<Vec<String>>,
+    pub(crate) runtime: Option<String>,
+    pub(crate) runtime_config: Option<serde_json::Value>,
     pub(crate) config: TomlValue,
 }
 
@@ -292,6 +310,10 @@ pub(crate) fn parse_agent_role_file_contents(
         ),
         parsed.nickname_candidates.as_deref(),
     )?;
+    let runtime = normalize_agent_role_runtime(
+        &format!("agent role file {}.runtime", role_file_label.display()),
+        parsed.runtime.as_deref(),
+    )?;
 
     let mut config = role_file_toml;
     let Some(config_table) = config.as_table_mut() else {
@@ -306,11 +328,15 @@ pub(crate) fn parse_agent_role_file_contents(
     config_table.remove("name");
     config_table.remove("description");
     config_table.remove("nickname_candidates");
+    config_table.remove("runtime");
+    config_table.remove("runtime_config");
 
     Ok(ResolvedAgentRoleFile {
         role_name,
         description,
         nickname_candidates,
+        runtime,
+        runtime_config: parsed.runtime_config,
         config,
     })
 }
@@ -471,6 +497,22 @@ fn normalize_agent_role_nickname_candidates(
     Ok(Some(normalized_candidates))
 }
 
+fn normalize_agent_role_runtime(
+    field_label: &str,
+    runtime: Option<&str>,
+) -> std::io::Result<Option<String>> {
+    runtime
+        .map(AgentRuntimeId::new)
+        .transpose()
+        .map(|runtime| runtime.map(|runtime| runtime.as_str().to_string()))
+        .map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{field_label} is invalid: {err}"),
+            )
+        })
+}
+
 async fn discover_agent_roles_in_dir(
     fs: &dyn ExecutorFileSystem,
     agents_dir: &AbsolutePathBuf,
@@ -511,6 +553,8 @@ async fn discover_agent_roles_in_dir(
                 description: parsed_file.description,
                 config_file: Some(agent_file.to_path_buf()),
                 nickname_candidates: parsed_file.nickname_candidates,
+                runtime: parsed_file.runtime,
+                runtime_config: parsed_file.runtime_config,
             },
         );
     }

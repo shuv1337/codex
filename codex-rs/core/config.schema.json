@@ -27,6 +27,10 @@
             "type": "string"
           },
           "type": "array"
+        },
+        "runtime": {
+          "description": "Agent runtime provider used for this role. Defaults to `codex`.",
+          "type": "string"
         }
       },
       "type": "object"

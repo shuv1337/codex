@@ -84,7 +84,7 @@ use codex_app_server_protocol::WarningNotification;
 use codex_app_server_protocol::build_item_from_guardian_event;
 use codex_app_server_protocol::guardian_auto_approval_review_notification;
 use codex_app_server_protocol::item_event_to_server_notification;
-use codex_core::CodexThread;
+use codex_core::ManagedAgentThread;
 use codex_core::ThreadManager;
 use codex_protocol::ThreadId;
 use codex_protocol::items::CollabAgentTool as CoreCollabAgentTool;
@@ -136,7 +136,7 @@ struct CommandExecutionCompletionItem {
 pub(crate) async fn apply_bespoke_event_handling(
     event: Event,
     conversation_id: ThreadId,
-    conversation: Arc<CodexThread>,
+    conversation: Arc<ManagedAgentThread>,
     thread_manager: Arc<ThreadManager>,
     outgoing: ThreadScopedOutgoingMessageSender,
     thread_state: Arc<tokio::sync::Mutex<ThreadState>>,
@@ -1570,7 +1570,7 @@ async fn on_request_user_input_response(
     event_turn_id: String,
     pending_request_id: RequestId,
     receiver: oneshot::Receiver<ClientRequestResult>,
-    conversation: Arc<CodexThread>,
+    conversation: Arc<ManagedAgentThread>,
     thread_state: Arc<Mutex<ThreadState>>,
     user_input_guard: ThreadWatchActiveGuard,
 ) {
@@ -1652,7 +1652,7 @@ async fn on_mcp_server_elicitation_response(
     request_id: codex_protocol::mcp::RequestId,
     pending_request_id: RequestId,
     receiver: oneshot::Receiver<ClientRequestResult>,
-    conversation: Arc<CodexThread>,
+    conversation: Arc<ManagedAgentThread>,
     thread_state: Arc<Mutex<ThreadState>>,
     permission_guard: ThreadWatchActiveGuard,
 ) {
@@ -1716,7 +1716,7 @@ fn mcp_server_elicitation_response_from_client_result(
 
 async fn on_request_permissions_response(
     pending_response: PendingRequestPermissionsResponse,
-    conversation: Arc<CodexThread>,
+    conversation: Arc<ManagedAgentThread>,
     thread_state: Arc<Mutex<ThreadState>>,
 ) {
     let PendingRequestPermissionsResponse {
@@ -1863,7 +1863,7 @@ async fn on_file_change_request_approval_response(
     item_id: String,
     pending_request_id: RequestId,
     receiver: oneshot::Receiver<ClientRequestResult>,
-    codex: Arc<CodexThread>,
+    codex: Arc<ManagedAgentThread>,
     thread_state: Arc<Mutex<ThreadState>>,
     permission_guard: ThreadWatchActiveGuard,
 ) {
@@ -1913,7 +1913,7 @@ async fn on_command_execution_request_approval_response(
     completion_item: Option<CommandExecutionCompletionItem>,
     pending_request_id: RequestId,
     receiver: oneshot::Receiver<ClientRequestResult>,
-    conversation: Arc<CodexThread>,
+    conversation: Arc<ManagedAgentThread>,
     outgoing: ThreadScopedOutgoingMessageSender,
     thread_state: Arc<Mutex<ThreadState>>,
     permission_guard: ThreadWatchActiveGuard,
@@ -2270,7 +2270,7 @@ mod tests {
 
     struct GuardianAssessmentTestContext {
         conversation_id: ThreadId,
-        conversation: Arc<CodexThread>,
+        conversation: Arc<ManagedAgentThread>,
         thread_manager: Arc<ThreadManager>,
         outgoing: ThreadScopedOutgoingMessageSender,
         thread_state: Arc<Mutex<ThreadState>>,
@@ -2624,7 +2624,7 @@ mod tests {
         );
         let guardian_context = GuardianAssessmentTestContext {
             conversation_id,
-            conversation: conversation.clone(),
+            conversation: Arc::new(ManagedAgentThread::from(conversation.clone())),
             thread_manager: thread_manager.clone(),
             outgoing: outgoing.clone(),
             thread_state: thread_state.clone(),
@@ -3245,7 +3245,7 @@ mod tests {
                 }),
             },
             conversation_id,
-            conversation,
+            Arc::new(ManagedAgentThread::from(conversation)),
             thread_manager,
             outgoing,
             thread_state,
@@ -3319,7 +3319,7 @@ mod tests {
                 }),
             },
             conversation_id,
-            conversation,
+            Arc::new(ManagedAgentThread::from(conversation)),
             thread_manager,
             outgoing,
             new_thread_state(),
@@ -3408,7 +3408,7 @@ mod tests {
                 }),
             },
             conversation_id,
-            conversation,
+            Arc::new(ManagedAgentThread::from(conversation)),
             thread_manager,
             outgoing,
             new_thread_state(),

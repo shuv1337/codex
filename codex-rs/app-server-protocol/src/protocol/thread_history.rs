@@ -234,6 +234,7 @@ impl ThreadHistoryChangeAccumulator {
 pub struct ThreadHistoryBuilder {
     turns: Vec<Turn>,
     current_turn: Option<PendingTurn>,
+    external_runtime: bool,
     next_item_index: i64,
     current_rollout_index: usize,
     next_rollout_index: usize,
@@ -251,6 +252,7 @@ impl ThreadHistoryBuilder {
         Self {
             turns: Vec::new(),
             current_turn: None,
+            external_runtime: false,
             next_item_index: 1,
             current_rollout_index: 0,
             next_rollout_index: 0,
@@ -391,6 +393,16 @@ impl ThreadHistoryBuilder {
             RolloutItem::EventMsg(event) => self.handle_event(event),
             RolloutItem::Compacted(payload) => self.handle_compacted(payload),
             RolloutItem::ResponseItem(item) => self.handle_response_item(item),
+            RolloutItem::ExternalRuntimeState(_) => {
+                self.external_runtime = true;
+            }
+            RolloutItem::ExternalRuntimeItem(external) => {
+                self.external_runtime = true;
+                self.upsert_item_in_turn_id(
+                    &external.turn_id,
+                    ThreadItem::from(external.item.clone()),
+                );
+            }
             RolloutItem::InterAgentCommunication(_)
             | RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::TurnContext(_)
@@ -597,27 +609,28 @@ impl ThreadHistoryBuilder {
             codex_protocol::items::TurnItem::EnteredReviewMode(_)
                 | codex_protocol::items::TurnItem::ExitedReviewMode(_)
         );
-        let should_upsert = match item {
-            codex_protocol::items::TurnItem::Plan(plan) => !plan.text.is_empty(),
-            codex_protocol::items::TurnItem::Sleep(_)
-            | codex_protocol::items::TurnItem::HookPrompt(_)
-            | codex_protocol::items::TurnItem::CommandExecution(_)
-            | codex_protocol::items::TurnItem::DynamicToolCall(_)
-            | codex_protocol::items::TurnItem::CollabAgentToolCall(_)
-            | codex_protocol::items::TurnItem::SubAgentActivity(_)
-            | codex_protocol::items::TurnItem::Extension(_)
-            | codex_protocol::items::TurnItem::EnteredReviewMode(_)
-            | codex_protocol::items::TurnItem::ExitedReviewMode(_) => true,
-            codex_protocol::items::TurnItem::UserMessage(_)
-            | codex_protocol::items::TurnItem::AgentMessage(_)
-            | codex_protocol::items::TurnItem::Reasoning(_)
-            | codex_protocol::items::TurnItem::WebSearch(_)
-            | codex_protocol::items::TurnItem::ImageView(_)
-            | codex_protocol::items::TurnItem::ImageGeneration(_)
-            | codex_protocol::items::TurnItem::FileChange(_)
-            | codex_protocol::items::TurnItem::McpToolCall(_)
-            | codex_protocol::items::TurnItem::ContextCompaction(_) => false,
-        };
+        let should_upsert = self.external_runtime
+            || match item {
+                codex_protocol::items::TurnItem::Plan(plan) => !plan.text.is_empty(),
+                codex_protocol::items::TurnItem::Sleep(_)
+                | codex_protocol::items::TurnItem::HookPrompt(_)
+                | codex_protocol::items::TurnItem::CommandExecution(_)
+                | codex_protocol::items::TurnItem::DynamicToolCall(_)
+                | codex_protocol::items::TurnItem::CollabAgentToolCall(_)
+                | codex_protocol::items::TurnItem::SubAgentActivity(_)
+                | codex_protocol::items::TurnItem::Extension(_)
+                | codex_protocol::items::TurnItem::EnteredReviewMode(_)
+                | codex_protocol::items::TurnItem::ExitedReviewMode(_) => true,
+                codex_protocol::items::TurnItem::UserMessage(_)
+                | codex_protocol::items::TurnItem::AgentMessage(_)
+                | codex_protocol::items::TurnItem::Reasoning(_)
+                | codex_protocol::items::TurnItem::WebSearch(_)
+                | codex_protocol::items::TurnItem::ImageView(_)
+                | codex_protocol::items::TurnItem::ImageGeneration(_)
+                | codex_protocol::items::TurnItem::FileChange(_)
+                | codex_protocol::items::TurnItem::McpToolCall(_)
+                | codex_protocol::items::TurnItem::ContextCompaction(_) => false,
+            };
 
         if should_upsert {
             let item = ThreadItem::from(item.clone());
@@ -1227,6 +1240,17 @@ impl ThreadHistoryBuilder {
     }
 
     fn handle_turn_started(&mut self, payload: &TurnStartedEvent) {
+        if let Some(turn) = self
+            .current_turn
+            .as_mut()
+            .filter(|turn| turn.id == payload.turn_id)
+        {
+            turn.status = TurnStatus::InProgress;
+            turn.started_at = turn.started_at.or(payload.started_at);
+            let changed_turn = ThreadHistoryTurnChange::from_pending_turn(turn);
+            self.record_changed_turn(changed_turn);
+            return;
+        }
         self.finish_current_turn();
         let turn = self
             .new_turn(Some(payload.turn_id.clone()))

@@ -98,6 +98,8 @@ mod effective_plugin_change;
 mod error_code;
 mod extensions;
 mod external_auth;
+#[cfg(debug_assertions)]
+mod fake_agent_runtime;
 mod filters;
 mod fs_watch;
 mod fuzzy_file_search;

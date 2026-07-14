@@ -77,6 +77,15 @@ impl ToolRouter {
         self.model_visible_specs.clone()
     }
 
+    /// Returns the handler-owned specification even when the tool is hidden from the model.
+    ///
+    /// External runtimes use this to expose a deliberately small set of Codex-hosted tools.
+    /// In code-mode-only turns those handlers remain registered for nested dispatch, but their
+    /// direct specifications are absent from `model_visible_specs`.
+    pub(crate) fn registered_tool_spec(&self, name: &ToolName) -> Option<ToolSpec> {
+        self.registry.tool(name).map(|tool| tool.spec())
+    }
+
     #[cfg(test)]
     pub(crate) fn registered_tool_names_for_test(&self) -> Vec<ToolName> {
         self.registry.tool_names_for_test()

@@ -315,6 +315,20 @@ impl TurnRequestProcessor {
         Ok((thread_id, thread))
     }
 
+    async fn load_managed_thread(
+        &self,
+        thread_id: &str,
+    ) -> Result<(ThreadId, Arc<codex_core::ManagedAgentThread>), JSONRPCErrorError> {
+        let thread_id = ThreadId::from_string(thread_id)
+            .map_err(|err| invalid_request(format!("invalid thread id: {err}")))?;
+        let thread = self
+            .thread_manager
+            .get_managed_thread(thread_id)
+            .await
+            .map_err(|_| invalid_request(format!("thread not found: {thread_id}")))?;
+        Ok((thread_id, thread))
+    }
+
     async fn ensure_direct_input_allowed(
         &self,
         request_id: &ConnectionRequestId,
@@ -1362,7 +1376,7 @@ impl TurnRequestProcessor {
         let TurnInterruptParams { thread_id, turn_id } = params;
         let is_startup_interrupt = turn_id.is_empty();
 
-        let (thread_uuid, thread) = self.load_thread(&thread_id).await?;
+        let (thread_uuid, thread) = self.load_managed_thread(&thread_id).await?;
 
         // Record turn interrupts so we can reply when TurnAborted arrives. Startup
         // interrupts do not have a turn and are acknowledged after submission.
@@ -1393,10 +1407,14 @@ impl TurnRequestProcessor {
 
         // Submit the interrupt. Turn interrupts respond upon TurnAborted; startup
         // interrupts respond here because startup cancellation has no turn event.
-        match self
-            .submit_core_op(request_id, thread.as_ref(), Op::Interrupt)
-            .await
-        {
+        let interrupt_result = match thread.as_codex_thread() {
+            Some(native_thread) => {
+                self.submit_core_op(request_id, native_thread.as_ref(), Op::Interrupt)
+                    .await
+            }
+            None => thread.submit(Op::Interrupt).await,
+        };
+        match interrupt_result {
             Ok(_) if is_startup_interrupt => Ok(Some(TurnInterruptResponse {})),
             Ok(_) => Ok(None),
             Err(err) => {

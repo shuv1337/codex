@@ -42,6 +42,7 @@ use crate::tools::router::ToolSuggestCandidates;
 use crate::tools::router::ToolSuggestPresentation;
 
 const MULTI_AGENT_V2_NAMESPACE: &str = "collaboration";
+const EXTERNAL_AGENT_RUNTIME_NAMESPACE: &str = "runtime_agents";
 
 #[derive(Default)]
 struct ToolPlanInputs {
@@ -1282,6 +1283,128 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
             .exposure(&ToolName::namespaced(MULTI_AGENT_V2_NAMESPACE, "spawn_agent").to_string()),
         ToolExposure::DirectModelOnly
     );
+}
+
+#[tokio::test]
+async fn multi_agent_v2_adds_runtime_spawn_without_changing_reserved_spawn_schema() {
+    let baseline = probe(|turn| {
+        set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
+        update_config(turn, |config| {
+            config.multi_agent_v2.hide_spawn_agent_metadata = true;
+        });
+    })
+    .await;
+    let plan = probe(|turn| {
+        set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
+        update_config(turn, |config| {
+            config.multi_agent_v2.hide_spawn_agent_metadata = true;
+            config.agent_roles.insert(
+                "pi-worker".to_string(),
+                crate::config::AgentRoleConfig {
+                    description: Some("Pi SDK worker".to_string()),
+                    runtime: Some("pi".to_string()),
+                    ..Default::default()
+                },
+            );
+        });
+    })
+    .await;
+
+    let reserved_spawn = |plan: &ToolPlanProbe| {
+        let ToolSpec::Namespace(namespace) = plan.visible_spec(MULTI_AGENT_V2_NAMESPACE) else {
+            panic!("expected {MULTI_AGENT_V2_NAMESPACE} namespace");
+        };
+        namespace
+            .tools
+            .iter()
+            .find_map(|tool| match tool {
+                ResponsesApiNamespaceTool::Function(tool) if tool.name == "spawn_agent" => {
+                    Some(tool.clone())
+                }
+                ResponsesApiNamespaceTool::Function(_) => None,
+            })
+            .expect("expected reserved collaboration.spawn_agent")
+    };
+    assert_eq!(
+        reserved_spawn(&baseline),
+        reserved_spawn(&plan),
+        "installing an external runtime role must not alter the full reserved collaboration.spawn_agent spec"
+    );
+
+    for (namespace_name, expects_runtime_metadata) in [
+        (MULTI_AGENT_V2_NAMESPACE, false),
+        (EXTERNAL_AGENT_RUNTIME_NAMESPACE, true),
+    ] {
+        let ToolSpec::Namespace(namespace) = plan.visible_spec(namespace_name) else {
+            panic!("expected {namespace_name} namespace");
+        };
+        let Some(ResponsesApiNamespaceTool::Function(spawn_agent)) =
+            namespace.tools.iter().find(|tool| {
+                matches!(
+                    tool,
+                    ResponsesApiNamespaceTool::Function(tool) if tool.name == "spawn_agent"
+                )
+            })
+        else {
+            panic!("expected spawn_agent in {namespace_name} namespace");
+        };
+        let properties = spawn_agent
+            .parameters
+            .properties
+            .as_ref()
+            .expect("spawn_agent should use object params");
+
+        for property in ["agent_type", "model", "reasoning_effort", "service_tier"] {
+            assert_eq!(
+                properties.contains_key(property),
+                expects_runtime_metadata,
+                "unexpected `{property}` visibility in {namespace_name}.spawn_agent"
+            );
+        }
+        assert_eq!(
+            properties
+                .get("message")
+                .and_then(|schema| schema.encrypted),
+            (!expects_runtime_metadata).then_some(true),
+            "unexpected message encryption in {namespace_name}.spawn_agent"
+        );
+        if expects_runtime_metadata {
+            assert!(
+                spawn_agent
+                    .parameters
+                    .required
+                    .as_ref()
+                    .is_some_and(|required| required.iter().any(|name| name == "agent_type")),
+                "runtime_agents.spawn_agent must require agent_type"
+            );
+            assert_eq!(
+                spawn_agent.output_schema,
+                Some(json!({
+                    "type": "object",
+                    "properties": {
+                        "task_name": {
+                            "type": "string",
+                            "description": "Canonical task name for the spawned agent."
+                        },
+                        "nickname": {
+                            "type": ["string", "null"],
+                            "description": "User-facing nickname for the spawned agent when available."
+                        }
+                    },
+                    "required": ["task_name", "nickname"],
+                    "additionalProperties": false
+                })),
+                "runtime output schema must match the handler's visible metadata result"
+            );
+            assert!(
+                properties
+                    .get("fork_turns")
+                    .and_then(|schema| schema.description.as_deref())
+                    .is_some_and(|description| description.contains("cannot fork Codex history")),
+                "runtime_agents.spawn_agent must advertise no-fork semantics"
+            );
+        }
+    }
 }
 
 #[tokio::test]

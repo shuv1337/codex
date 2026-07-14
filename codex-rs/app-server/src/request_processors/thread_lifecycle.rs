@@ -143,7 +143,7 @@ pub(super) async fn ensure_conversation_listener(
 ) -> Result<EnsureConversationListenerResult, JSONRPCErrorError> {
     let conversation = match listener_task_context
         .thread_manager
-        .get_thread(conversation_id)
+        .get_managed_thread(conversation_id)
         .await
     {
         Ok(conv) => conv,
@@ -213,7 +213,7 @@ pub(super) fn log_listener_attach_result(
 pub(super) async fn ensure_listener_task_running(
     listener_task_context: ListenerTaskContext,
     conversation_id: ThreadId,
-    conversation: Arc<CodexThread>,
+    conversation: Arc<ManagedAgentThread>,
     thread_state: Arc<Mutex<ThreadState>>,
 ) -> Result<(), JSONRPCErrorError> {
     let (cancel_tx, mut cancel_rx) = oneshot::channel();
@@ -228,16 +228,19 @@ pub(super) async fn ensure_listener_task_running(
             "thread {conversation_id} is closing; retry after the thread is closed"
         )));
     };
-    let config = conversation.config().await;
-    let environments = conversation.environment_selections().await;
-    let watch_registration = listener_task_context
-        .skills_watcher
-        .register_thread_config(
-            config.as_ref(),
-            listener_task_context.thread_manager.as_ref(),
-            &environments,
-        )
-        .await;
+    let watch_registration = if let Some(config) = conversation.config().await {
+        let environments = conversation.environment_selections().await;
+        listener_task_context
+            .skills_watcher
+            .register_thread_config(
+                config.as_ref(),
+                listener_task_context.thread_manager.as_ref(),
+                &environments,
+            )
+            .await
+    } else {
+        codex_file_watcher::WatchRegistration::default()
+    };
     let thread_settings_baseline =
         thread_settings_from_config_snapshot(&conversation.config_snapshot().await);
     let (mut listener_command_rx, listener_generation) = {
@@ -386,6 +389,16 @@ pub(super) async fn ensure_listener_task_running(
     Ok(())
 }
 
+pub(super) async fn wait_for_managed_thread_shutdown(
+    thread: &Arc<ManagedAgentThread>,
+) -> ThreadShutdownResult {
+    match tokio::time::timeout(Duration::from_secs(10), thread.shutdown_and_wait()).await {
+        Ok(Ok(())) => ThreadShutdownResult::Complete,
+        Ok(Err(_)) => ThreadShutdownResult::SubmitFailed,
+        Err(_) => ThreadShutdownResult::TimedOut,
+    }
+}
+
 pub(super) async fn wait_for_thread_shutdown(thread: &Arc<CodexThread>) -> ThreadShutdownResult {
     match tokio::time::timeout(Duration::from_secs(10), thread.shutdown_and_wait()).await {
         Ok(Ok(())) => ThreadShutdownResult::Complete,
@@ -401,7 +414,7 @@ pub(super) async fn unload_thread_without_subscribers(
     thread_state_manager: ThreadStateManager,
     thread_watch_manager: ThreadWatchManager,
     thread_id: ThreadId,
-    thread: Arc<CodexThread>,
+    thread: Arc<ManagedAgentThread>,
 ) {
     info!("thread {thread_id} has no subscribers and is idle; shutting down");
 
@@ -413,9 +426,13 @@ pub(super) async fn unload_thread_without_subscribers(
     thread_state_manager.remove_thread_state(thread_id).await;
 
     tokio::spawn(async move {
-        match wait_for_thread_shutdown(&thread).await {
+        match wait_for_managed_thread_shutdown(&thread).await {
             ThreadShutdownResult::Complete => {
-                if thread_manager.remove_thread(&thread_id).await.is_none() {
+                if thread_manager
+                    .remove_managed_thread(&thread_id)
+                    .await
+                    .is_none()
+                {
                     info!("thread {thread_id} was already removed before teardown finalized");
                     thread_watch_manager
                         .remove_thread(&thread_id.to_string())
@@ -449,7 +466,7 @@ pub(super) async fn unload_thread_without_subscribers(
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_thread_listener_command(
     conversation_id: ThreadId,
-    conversation: &Arc<CodexThread>,
+    conversation: &Arc<ManagedAgentThread>,
     codex_home: &Path,
     thread_state_manager: &ThreadStateManager,
     thread_state: &Arc<Mutex<ThreadState>>,
@@ -519,7 +536,7 @@ pub(super) async fn handle_thread_listener_command(
 )]
 pub(super) async fn handle_pending_thread_resume_request(
     conversation_id: ThreadId,
-    conversation: &Arc<CodexThread>,
+    conversation: &Arc<ManagedAgentThread>,
     _codex_home: &Path,
     thread_state_manager: &ThreadStateManager,
     thread_state: &Arc<Mutex<ThreadState>>,
@@ -668,7 +685,7 @@ pub(super) async fn handle_pending_thread_resume_request(
         );
         // Rejoining a loaded thread has the same UI contract as a cold resume, but
         // uses the live conversation state instead of reconstructing a new session.
-        send_thread_token_usage_update_to_connection(
+        send_managed_thread_token_usage_update_to_connection(
             outgoing,
             connection_id,
             conversation_id,

@@ -7283,6 +7283,8 @@ async fn load_config_rejects_missing_agent_role_config_file() -> std::io::Result
                 "researcher".to_string(),
                 AgentRoleToml {
                     description: Some("Research role".to_string()),
+                    runtime: None,
+                    runtime_config: None,
                     config_file: Some(missing_path.abs()),
                     nickname_candidates: None,
                 },
@@ -7327,6 +7329,7 @@ async fn agent_role_relative_config_file_resolves_against_config_toml() -> std::
 description = "Research role"
 config_file = "./agents/researcher.toml"
 nickname_candidates = ["Hypatia", "Noether"]
+runtime = "pi"
 "#,
     )
     .await?;
@@ -7350,6 +7353,13 @@ nickname_candidates = ["Hypatia", "Noether"]
             .and_then(|role| role.nickname_candidates.as_ref())
             .map(|candidates| candidates.iter().map(String::as_str).collect::<Vec<_>>()),
         Some(vec!["Hypatia", "Noether"])
+    );
+    assert_eq!(
+        config
+            .agent_roles
+            .get("researcher")
+            .and_then(|role| role.runtime.as_deref()),
+        Some("pi")
     );
 
     Ok(())
@@ -7428,6 +7438,7 @@ async fn agent_role_file_metadata_overrides_config_toml_metadata() -> std::io::R
         r#"
 description = "Role metadata from file"
 nickname_candidates = ["Hypatia"]
+runtime = "pi"
 developer_instructions = "Research carefully"
 model = "gpt-5.2"
 "#,
@@ -7439,6 +7450,7 @@ model = "gpt-5.2"
 description = "Research role from config"
 config_file = "./agents/researcher.toml"
 nickname_candidates = ["Noether"]
+runtime = "fake"
 "#,
     )
     .await?;
@@ -7460,6 +7472,7 @@ nickname_candidates = ["Noether"]
             .map(|candidates| candidates.iter().map(String::as_str).collect::<Vec<_>>()),
         Some(vec!["Hypatia"])
     );
+    assert_eq!(role.runtime.as_deref(), Some("pi"));
 
     Ok(())
 }
@@ -7831,6 +7844,46 @@ nickname_candidates = ["Atlas"]
             .and_then(|role| role.nickname_candidates.as_ref())
             .map(|candidates| candidates.iter().map(String::as_str).collect::<Vec<_>>()),
         Some(vec!["Atlas"])
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn loads_external_runtime_config_from_agent_role() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    tokio::fs::write(
+        codex_home.path().join(CONFIG_TOML_FILE),
+        r#"[agents.pi_worker]
+description = "Pi worker"
+runtime = "pi"
+
+[agents.pi_worker.runtime_config]
+provider = "faux"
+model = "faux-1"
+thinking_level = "high"
+"#,
+    )
+    .await?;
+
+    let config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(codex_home.path().to_path_buf()))
+        .build()
+        .await?;
+    let role = config
+        .agent_roles
+        .get("pi_worker")
+        .expect("Pi role should be loaded");
+
+    assert_eq!(role.runtime.as_deref(), Some("pi"));
+    assert_eq!(
+        role.runtime_config,
+        Some(serde_json::json!({
+            "provider": "faux",
+            "model": "faux-1",
+            "thinking_level": "high",
+        }))
     );
 
     Ok(())
@@ -8231,6 +8284,8 @@ async fn load_config_normalizes_agent_role_nickname_candidates() -> std::io::Res
                 "researcher".to_string(),
                 AgentRoleToml {
                     description: Some("Research role".to_string()),
+                    runtime: None,
+                    runtime_config: None,
                     config_file: None,
                     nickname_candidates: Some(vec![
                         "  Hypatia  ".to_string(),
@@ -8274,6 +8329,8 @@ async fn load_config_rejects_empty_agent_role_nickname_candidates() -> std::io::
                 "researcher".to_string(),
                 AgentRoleToml {
                     description: Some("Research role".to_string()),
+                    runtime: None,
+                    runtime_config: None,
                     config_file: None,
                     nickname_candidates: Some(Vec::new()),
                 },
@@ -8311,6 +8368,8 @@ async fn load_config_rejects_duplicate_agent_role_nickname_candidates() -> std::
                 "researcher".to_string(),
                 AgentRoleToml {
                     description: Some("Research role".to_string()),
+                    runtime: None,
+                    runtime_config: None,
                     config_file: None,
                     nickname_candidates: Some(vec!["Hypatia".to_string(), " Hypatia ".to_string()]),
                 },
@@ -8348,6 +8407,8 @@ async fn load_config_rejects_unsafe_agent_role_nickname_candidates() -> std::io:
                 "researcher".to_string(),
                 AgentRoleToml {
                     description: Some("Research role".to_string()),
+                    runtime: None,
+                    runtime_config: None,
                     config_file: None,
                     nickname_candidates: Some(vec!["Agent <One>".to_string()]),
                 },

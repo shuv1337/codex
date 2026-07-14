@@ -719,6 +719,12 @@ pub struct AgentRoleToml {
 
     /// Candidate nicknames for agents spawned with this role.
     pub nickname_candidates: Option<Vec<String>>,
+
+    /// Agent runtime provider used for this role. Defaults to `codex`.
+    pub runtime: Option<String>,
+
+    /// Provider-specific configuration forwarded to the selected agent runtime.
+    pub runtime_config: Option<serde_json::Value>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]

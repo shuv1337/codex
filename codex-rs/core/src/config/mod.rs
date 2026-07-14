@@ -2168,6 +2168,10 @@ pub struct AgentRoleConfig {
     pub config_file: Option<PathBuf>,
     /// Candidate nicknames for agents spawned with this role.
     pub nickname_candidates: Option<Vec<String>>,
+    /// Agent runtime provider used for this role. `None` selects native Codex.
+    pub runtime: Option<String>,
+    /// Provider-specific configuration forwarded to the selected agent runtime.
+    pub runtime_config: Option<serde_json::Value>,
 }
 
 fn resolve_tool_suggest_config(

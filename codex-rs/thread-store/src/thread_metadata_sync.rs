@@ -244,6 +244,25 @@ impl ThreadMetadataSync {
                     update.approval_mode = Some(turn_ctx.approval_policy);
                     update.permission_profile = Some(turn_ctx.permission_profile());
                 }
+                RolloutItem::ExternalRuntimeState(state) => {
+                    if let Some(provider) = state
+                        .metadata
+                        .get("provider")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|value| !value.is_empty())
+                    {
+                        update.model_provider = Some(provider.to_string());
+                    }
+                    if let Some(model) = state
+                        .metadata
+                        .get("model")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|value| !value.is_empty())
+                    {
+                        update.model = Some(model.to_string());
+                    }
+                }
+                RolloutItem::ExternalRuntimeItem(_) => {}
                 RolloutItem::EventMsg(EventMsg::UserMessage(user)) => {
                     self.observe_user_message(user, &mut update);
                 }

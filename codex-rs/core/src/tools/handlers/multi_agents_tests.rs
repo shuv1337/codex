@@ -133,6 +133,8 @@ model_reasoning_effort = "minimal"
             description: Some("Role with model overrides".to_string()),
             config_file: Some(role_config_path),
             nickname_candidates: None,
+            runtime: None,
+            runtime_config: None,
         },
     );
     turn.config = Arc::new(config);
@@ -682,6 +684,8 @@ service_tier = "priority"
                 description: Some("Role with a child service tier".to_string()),
                 config_file: Some(role_config_path),
                 nickname_candidates: None,
+                runtime: None,
+                runtime_config: None,
             },
         );
         turn.config = Arc::new(config);
@@ -755,6 +759,8 @@ service_tier = "turbo"
             description: Some("Role with an unsupported child tier".to_string()),
             config_file: Some(role_config_path),
             nickname_candidates: None,
+            runtime: None,
+            runtime_config: None,
         },
     );
     turn.config = Arc::new(config);
@@ -818,6 +824,8 @@ service_tier = "priority"
             description: Some("Role with a supported child tier".to_string()),
             config_file: Some(role_config_path),
             nickname_candidates: None,
+            runtime: None,
+            runtime_config: None,
         },
     );
     turn.config = Arc::new(config);

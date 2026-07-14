@@ -19,6 +19,7 @@ use codex_app_server_protocol::ThreadTokenUsageUpdatedNotification;
 use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnStatus;
 use codex_core::CodexThread;
+use codex_core::ManagedAgentThread;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
@@ -42,6 +43,30 @@ pub(super) async fn send_thread_token_usage_update_to_connection(
     token_usage_turn_id: Option<String>,
 ) {
     let Some(info) = conversation.token_usage_info().await else {
+        return;
+    };
+    let notification = ThreadTokenUsageUpdatedNotification {
+        thread_id: thread_id.to_string(),
+        turn_id: token_usage_turn_id.unwrap_or_else(|| latest_token_usage_turn_id(thread)),
+        token_usage: ThreadTokenUsage::from(info),
+    };
+    outgoing
+        .send_server_notification_to_connections(
+            &[connection_id],
+            ServerNotification::ThreadTokenUsageUpdated(notification),
+        )
+        .await;
+}
+
+pub(super) async fn send_managed_thread_token_usage_update_to_connection(
+    outgoing: &Arc<OutgoingMessageSender>,
+    connection_id: ConnectionId,
+    thread_id: ThreadId,
+    thread: &Thread,
+    conversation: &ManagedAgentThread,
+    token_usage_turn_id: Option<String>,
+) {
+    let Ok(Some(info)) = conversation.token_usage_info().await else {
         return;
     };
     let notification = ThreadTokenUsageUpdatedNotification {

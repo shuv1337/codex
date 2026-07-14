@@ -1,0 +1,247 @@
+syntax = "proto3";
+
+package pi.codex.runtime.v1;
+
+message Envelope {
+  uint32 protocol_version = 1;
+  oneof payload {
+    HandshakeRequest handshake_request = 2;
+    HandshakeResponse handshake_response = 3;
+    RuntimeRequest request = 4;
+    RuntimeResponse response = 5;
+    SessionEvent event = 6;
+    HostToolRequest host_tool_request = 7;
+    HostToolResult host_tool_result = 8;
+  }
+}
+
+message HandshakeRequest {
+  uint32 minimum_version = 1;
+  uint32 maximum_version = 2;
+  string client_name = 3;
+  string client_version = 4;
+}
+
+message HandshakeResponse {
+  uint32 selected_version = 1;
+  string server_name = 2;
+  string server_version = 3;
+  repeated string capabilities = 4;
+  RuntimeError error = 5;
+}
+
+message RuntimeRequest {
+  string request_id = 1;
+  string session_id = 2;
+  oneof command {
+    SpawnRequest spawn = 3;
+    ResumeRequest resume = 4;
+    PromptRequest prompt = 5;
+    SteerRequest steer = 6;
+    FollowUpRequest follow_up = 7;
+    InterruptRequest interrupt = 8;
+    CloseRequest close = 9;
+    StatusRequest status = 10;
+  }
+}
+
+message RuntimeResponse {
+  string request_id = 1;
+  string session_id = 2;
+  oneof result {
+    Ack ack = 3;
+    SpawnedSession spawned = 4;
+    SessionStatus status = 5;
+    RuntimeError error = 6;
+  }
+}
+
+message Ack {}
+
+message RuntimeError {
+  string code = 1;
+  string message = 2;
+  bool retryable = 3;
+  bytes details_json = 4;
+}
+
+message HostToolDefinition {
+  string name = 1;
+  string description = 2;
+  bytes input_schema_json = 3;
+}
+
+message SpawnRequest {
+  string codex_thread_id = 1;
+  string cwd = 2;
+  string agent_dir = 3;
+  string session_dir = 4;
+  string provider = 5;
+  string model = 6;
+  string thinking_level = 7;
+  repeated HostToolDefinition host_tools = 8;
+}
+
+message ResumeRequest {
+  string codex_thread_id = 1;
+  string session_locator = 2;
+  string cwd_override = 3;
+  repeated HostToolDefinition host_tools = 4;
+}
+
+message PromptRequest {
+  string text = 1;
+}
+
+message SteerRequest {
+  string text = 1;
+}
+
+message FollowUpRequest {
+  string text = 1;
+}
+
+message InterruptRequest {}
+
+message CloseRequest {}
+
+message StatusRequest {}
+
+message SpawnedSession {
+  string session_locator = 1;
+  string provider = 2;
+  string model = 3;
+  string thinking_level = 4;
+}
+
+message SessionStatus {
+  string state = 1;
+  string message = 2;
+  TokenUsage token_usage = 3;
+}
+
+message SessionEvent {
+  string session_id = 1;
+  uint64 sequence = 2;
+  oneof event {
+    AgentStart agent_start = 3;
+    TurnStart turn_start = 4;
+    MessageStart message_start = 5;
+    MessageDelta text_delta = 6;
+    MessageDelta thinking_delta = 7;
+    MessageEnd message_end = 8;
+    ToolExecutionStart tool_execution_start = 9;
+    ToolExecutionUpdate tool_execution_update = 10;
+    ToolExecutionEnd tool_execution_end = 11;
+    TurnEnd turn_end = 12;
+    AgentEnd agent_end = 13;
+    QueueUpdate queue_update = 14;
+    CompactionEvent compaction = 15;
+    RetryEvent retry = 16;
+    ErrorEvent error = 17;
+    TokenUsage token_usage = 18;
+  }
+}
+
+message AgentStart {}
+
+message TurnStart {
+  uint32 turn_index = 1;
+}
+
+message MessageStart {
+  string message_id = 1;
+  string role = 2;
+}
+
+message MessageDelta {
+  string message_id = 1;
+  uint32 content_index = 2;
+  string delta = 3;
+}
+
+message MessageEnd {
+  string message_id = 1;
+  string role = 2;
+  bytes message_json = 3;
+}
+
+message ToolExecutionStart {
+  string tool_call_id = 1;
+  string tool_name = 2;
+  bytes arguments_json = 3;
+}
+
+message ToolExecutionUpdate {
+  string tool_call_id = 1;
+  string tool_name = 2;
+  bytes partial_result_json = 3;
+}
+
+message ToolExecutionEnd {
+  string tool_call_id = 1;
+  string tool_name = 2;
+  bytes result_json = 3;
+  bool is_error = 4;
+}
+
+message TurnEnd {
+  uint32 turn_index = 1;
+  bytes assistant_message_json = 2;
+}
+
+message AgentEnd {
+  string last_assistant_text = 1;
+  bool will_retry = 2;
+}
+
+message QueueUpdate {
+  uint32 steering_count = 1;
+  uint32 follow_up_count = 2;
+}
+
+message CompactionEvent {
+  string phase = 1;
+  string reason = 2;
+  bool aborted = 3;
+  string error_message = 4;
+}
+
+message RetryEvent {
+  string phase = 1;
+  uint32 attempt = 2;
+  uint32 maximum_attempts = 3;
+  uint64 delay_ms = 4;
+  string error_message = 5;
+  bool success = 6;
+}
+
+message ErrorEvent {
+  string code = 1;
+  string message = 2;
+  bool retryable = 3;
+}
+
+message TokenUsage {
+  uint64 input_tokens = 1;
+  uint64 output_tokens = 2;
+  uint64 cache_read_tokens = 3;
+  uint64 cache_write_tokens = 4;
+  uint64 total_tokens = 5;
+}
+
+message HostToolRequest {
+  string request_id = 1;
+  string session_id = 2;
+  string tool_call_id = 3;
+  string tool_name = 4;
+  bytes arguments_json = 5;
+}
+
+message HostToolResult {
+  string request_id = 1;
+  string session_id = 2;
+  string tool_call_id = 3;
+  bytes result_json = 4;
+  RuntimeError error = 5;
+}

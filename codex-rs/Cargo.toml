@@ -56,6 +56,7 @@ members = [
     "ext/items",
     "ext/memories",
     "ext/mcp",
+    "ext/pi-runtime",
     "ext/skills",
     "ext/web-search",
     "external-agent-migration",
@@ -214,6 +215,7 @@ codex-network-proxy = { path = "network-proxy" }
 codex-ollama = { path = "ollama" }
 codex-otel = { path = "otel" }
 codex-plugin = { path = "plugin" }
+codex-pi-runtime = { path = "ext/pi-runtime" }
 codex-model-provider = { path = "model-provider" }
 codex-process-hardening = { path = "process-hardening" }
 codex-protocol = { path = "protocol" }
@@ -363,6 +365,7 @@ pathdiff = "0.2"
 portable-pty = "0.9.0"
 predicates = "3"
 pretty_assertions = "1.4.1"
+prost = "0.14.3"
 pulldown-cmark = "0.10"
 quick-xml = "0.41.0"
 rand = "0.9"

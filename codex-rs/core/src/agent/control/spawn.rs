@@ -69,7 +69,9 @@ fn keep_forked_rollout_item(item: &RolloutItem, preserve_reference_context_item:
             | ResponseItem::Other,
         ) => false,
         RolloutItem::InterAgentCommunication(_)
-        | RolloutItem::InterAgentCommunicationMetadata { .. } => false,
+        | RolloutItem::InterAgentCommunicationMetadata { .. }
+        | RolloutItem::ExternalRuntimeItem(_)
+        | RolloutItem::ExternalRuntimeState(_) => false,
         // Full-history forks preserve the cached prompt prefix and can keep diffing
         // from the parent's durable baseline. Truncated forks drop part of that prompt,
         // so they must rebuild context on their first child turn.
@@ -296,8 +298,80 @@ impl AgentControl {
             other => (other, AgentMetadata::default()),
         };
         let notification_source = session_source.clone();
+        let role_name = notification_source
+            .as_ref()
+            .and_then(SessionSource::get_agent_role);
+        let runtime_id = resolve_role_runtime_id(&config, role_name.as_deref())
+            .map_err(CodexErr::InvalidRequest)?;
+        let runtime = state
+            .resolve_agent_runtime(&runtime_id)
+            .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;
 
         // The same `AgentControl` is sent to spawn the thread.
+        match runtime {
+            ResolvedAgentRuntime::Codex => {}
+            ResolvedAgentRuntime::External(provider) => {
+                if options.fork_mode.is_some() {
+                    return Err(CodexErr::UnsupportedOperation(format!(
+                        "agent runtime `{}` does not support fork spawning",
+                        provider.id()
+                    )));
+                }
+                let session_source = session_source.clone().ok_or_else(|| {
+                    CodexErr::UnsupportedOperation(format!(
+                        "agent runtime `{}` can only spawn child threads",
+                        provider.id()
+                    ))
+                })?;
+                let thread_id = state
+                    .spawn_external_agent_thread(
+                        provider,
+                        &config,
+                        session_source,
+                        multi_agent_version,
+                        options.environments.clone(),
+                    )
+                    .await?;
+                agent_metadata.agent_id = Some(thread_id);
+                reservation.commit(agent_metadata.clone());
+                if let Some(residency_slot) = residency_slot {
+                    residency_slot.commit(thread_id);
+                }
+                state.notify_thread_created(thread_id);
+
+                match initial_input {
+                    SpawnInitialInput::UserInput(input) => {
+                        self.send_input_after_capacity_check(thread_id, &state, input)
+                            .await?;
+                    }
+                    SpawnInitialInput::InterAgentCommunication(communication, context) => {
+                        self.send_inter_agent_communication_after_capacity_check(
+                            thread_id,
+                            &state,
+                            communication,
+                            context,
+                        )
+                        .await?;
+                    }
+                }
+                let child_reference = agent_metadata
+                    .agent_path
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| thread_id.to_string());
+                self.maybe_start_completion_watcher(
+                    thread_id,
+                    notification_source,
+                    child_reference,
+                    agent_metadata.agent_path.clone(),
+                );
+                return Ok(LiveAgent {
+                    thread_id,
+                    metadata: agent_metadata,
+                    status: self.get_status(thread_id).await,
+                });
+            }
+        }
         let new_thread = match (session_source, options.fork_mode.as_ref(), inheritance) {
             (Some(session_source), Some(_), inheritance) => {
                 Box::pin(self.spawn_forked_thread(
@@ -340,13 +414,25 @@ impl AgentControl {
         )) = notification_source.as_ref()
         {
             let client_metadata = match state.get_thread(*parent_thread_id).await {
-                Ok(parent_thread) => {
-                    parent_thread
-                        .codex
-                        .session
-                        .app_server_client_metadata()
-                        .await
-                }
+                Ok(parent_thread) => match parent_thread.as_codex_thread() {
+                    Some(parent_thread) => {
+                        parent_thread
+                            .codex
+                            .session
+                            .app_server_client_metadata()
+                            .await
+                    }
+                    None => {
+                        tracing::warn!(
+                            parent_thread_id = %parent_thread_id,
+                            "skipping subagent thread analytics: parent uses an external runtime"
+                        );
+                        crate::session::session::AppServerClientMetadata {
+                            client_name: None,
+                            client_version: None,
+                        }
+                    }
+                },
                 Err(error) => {
                     tracing::warn!(
                         error = %error,
@@ -498,6 +584,11 @@ impl AgentControl {
         let multi_agent_v2_usage_hint_texts_to_filter: Vec<String> =
             if let Some(parent_thread) = parent_thread.as_ref() {
                 if multi_agent_version == MultiAgentVersion::V2 {
+                    let parent_thread = parent_thread.as_codex_thread().ok_or_else(|| {
+                        CodexErr::UnsupportedOperation(
+                            "forking from an external agent runtime is not supported".to_string(),
+                        )
+                    })?;
                     let parent_config = parent_thread.codex.session.get_config().await;
                     [
                         parent_config
@@ -743,7 +834,9 @@ impl AgentControl {
         // Resumed threads are re-registered in-memory and need the same listener
         // attachment path as freshly spawned threads.
         state.notify_thread_created(resumed_thread.thread_id);
-        if multi_agent_version != MultiAgentVersion::V2 {
+        if multi_agent_version != MultiAgentVersion::V2
+            || resumed_thread.thread.as_codex_thread().is_none()
+        {
             let child_reference = agent_metadata
                 .agent_path
                 .as_ref()
@@ -756,12 +849,14 @@ impl AgentControl {
                 agent_metadata.agent_path.clone(),
             );
         }
-        self.persist_thread_spawn_edge_for_source(
-            resumed_thread.thread.as_ref(),
-            resumed_thread.thread_id,
-            Some(&notification_source),
-        )
-        .await;
+        if let Some(native_thread) = resumed_thread.thread.as_codex_thread() {
+            self.persist_thread_spawn_edge_for_source(
+                native_thread.as_ref(),
+                resumed_thread.thread_id,
+                Some(&notification_source),
+            )
+            .await;
+        }
 
         Ok((resumed_thread.thread_id, multi_agent_version))
     }

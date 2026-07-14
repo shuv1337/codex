@@ -76,11 +76,43 @@ pub fn create_spawn_agent_tool_v1(options: SpawnAgentToolOptions) -> ToolSpec {
 }
 
 pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions) -> ToolSpec {
+    create_spawn_agent_tool_v2_with_message_encryption(options, /*encrypt_message*/ true)
+}
+
+pub fn create_external_runtime_spawn_agent_tool_v2(options: SpawnAgentToolOptions) -> ToolSpec {
+    create_spawn_agent_tool_v2_with_options(
+        options, /*encrypt_message*/ false, /*require_agent_type*/ true,
+        /*external_runtime_only*/ true,
+    )
+}
+
+fn create_spawn_agent_tool_v2_with_message_encryption(
+    options: SpawnAgentToolOptions,
+    encrypt_message: bool,
+) -> ToolSpec {
+    create_spawn_agent_tool_v2_with_options(
+        options,
+        encrypt_message,
+        /*require_agent_type*/ false,
+        /*external_runtime_only*/ false,
+    )
+}
+
+fn create_spawn_agent_tool_v2_with_options(
+    options: SpawnAgentToolOptions,
+    encrypt_message: bool,
+    require_agent_type: bool,
+    external_runtime_only: bool,
+) -> ToolSpec {
     let available_models_description = (!options.hide_agent_type_model_reasoning)
         .then(|| spawn_agent_models_description(&options.available_models));
     let inherited_model_guidance =
         (!options.hide_agent_type_model_reasoning).then_some(SPAWN_AGENT_INHERITED_MODEL_GUIDANCE);
-    let mut properties = spawn_agent_common_properties_v2(&options.agent_type_description);
+    let mut properties = spawn_agent_common_properties_v2(
+        &options.agent_type_description,
+        encrypt_message,
+        external_runtime_only,
+    );
     if options.hide_agent_type_model_reasoning {
         hide_spawn_agent_metadata_options(&mut properties);
     }
@@ -98,12 +130,19 @@ pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions) -> ToolSpec {
             available_models_description.as_deref(),
             inherited_model_guidance,
             options.usage_hint_text,
+            external_runtime_only,
         ),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::object(
             properties,
-            Some(vec!["task_name".to_string(), "message".to_string()]),
+            Some({
+                let mut required = vec!["task_name".to_string(), "message".to_string()];
+                if require_agent_type {
+                    required.push("agent_type".to_string());
+                }
+                required
+            }),
             Some(false.into()),
         ),
         output_schema: Some(spawn_agent_output_schema_v2(
@@ -592,31 +631,38 @@ fn spawn_agent_common_properties_v1(agent_type_description: &str) -> BTreeMap<St
     ])
 }
 
-fn spawn_agent_common_properties_v2(agent_type_description: &str) -> BTreeMap<String, JsonSchema> {
+fn spawn_agent_common_properties_v2(
+    agent_type_description: &str,
+    encrypt_message: bool,
+    external_runtime_only: bool,
+) -> BTreeMap<String, JsonSchema> {
+    let message_schema = JsonSchema::string(Some(
+        "Initial plain-text task for the new agent.".to_string(),
+    ));
+    let message_schema = if encrypt_message {
+        message_schema.with_encrypted()
+    } else {
+        message_schema
+    };
     BTreeMap::from([
-        (
-            "message".to_string(),
-            JsonSchema::string(Some(
-                "Initial plain-text task for the new agent.".to_string(),
-            ))
-            .with_encrypted(),
-        ),
+        ("message".to_string(), message_schema),
         (
             "agent_type".to_string(),
             JsonSchema::string(Some(agent_type_description.to_string())),
         ),
         (
             "fork_turns".to_string(),
-            JsonSchema::string(Some(
+            JsonSchema::string(Some(if external_runtime_only {
+                "External runtimes cannot fork Codex history. Omit this field or pass `none`."
+                    .to_string()
+            } else {
                 "Optional number of turns to fork. Defaults to `all`. Use `none`, `all`, or a positive integer string such as `3` to fork only the most recent turns."
-                    .to_string(),
-            )),
+                        .to_string()
+            })),
         ),
         (
             "model".to_string(),
-            JsonSchema::string(Some(
-                SPAWN_AGENT_MODEL_OVERRIDE_DESCRIPTION.to_string(),
-            )),
+            JsonSchema::string(Some(SPAWN_AGENT_MODEL_OVERRIDE_DESCRIPTION.to_string())),
         ),
         (
             "reasoning_effort".to_string(),
@@ -712,10 +758,16 @@ fn spawn_agent_tool_description_v2(
     available_models_description: Option<&str>,
     inherited_model_guidance: Option<&str>,
     usage_hint_text: Option<String>,
+    external_runtime_only: bool,
 ) -> String {
     let agent_role_guidance = available_models_description.unwrap_or_default();
     let inherited_model_guidance = inherited_model_guidance.unwrap_or_default();
 
+    let fork_guidance = if external_runtime_only {
+        "External runtime agents do not inherit Codex turn history. Omit `fork_turns` or pass `none`."
+    } else {
+        "Note that passing `fork_turns=\"none\"` will not pass any surrounding context to the spawned subagent, which may cause the agent to lack the context it needs to complete its task, whereas `fork_turns=\"all\"` will provide the subagent with all surrounding context."
+    };
     let tool_description = format!(
         r#"
         {agent_role_guidance}
@@ -727,7 +779,7 @@ Only call this tool for a concrete, bounded subtask that can run independently a
 It will be able to send you and other running agents messages, and its final answer will be provided to you when it finishes.
 The new agent's canonical task name will be provided to it along with the message.
 
-Note that passing `fork_turns="none"` will not pass any surrounding context to the spawned subagent, which may cause the agent to lack the context it needs to complete its task, whereas `fork_turns="all"` will provide the subagent with all surrounding context."#
+{fork_guidance}"#
     );
 
     if let Some(usage_hint_text) = usage_hint_text {

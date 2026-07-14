@@ -73,7 +73,15 @@ pub fn project_rollout_line(line: &RolloutLine) -> ThreadHistoryChangeSet {
             }],
             ..Default::default()
         },
+        RolloutItem::ExternalRuntimeItem(external) => ThreadHistoryChangeSet {
+            changed_items: vec![ThreadHistoryItemChange {
+                turn_id: external.turn_id.clone(),
+                item: ThreadItem::from(external.item.clone()),
+            }],
+            ..Default::default()
+        },
         RolloutItem::SessionMeta(_)
+        | RolloutItem::ExternalRuntimeState(_)
         | RolloutItem::ResponseItem(_)
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }

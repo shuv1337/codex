@@ -72,6 +72,36 @@ async fn apply_role_returns_error_for_unknown_role() {
 }
 
 #[tokio::test]
+async fn role_runtime_defaults_to_codex() {
+    let (_home, config) = test_config_with_cli_overrides(Vec::new()).await;
+
+    assert_eq!(
+        resolve_role_runtime_id(&config, /*role_name*/ None).expect("resolve default runtime"),
+        AgentRuntimeId::codex()
+    );
+}
+
+#[tokio::test]
+async fn role_runtime_uses_configured_provider() {
+    let (_home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+    config.agent_roles.insert(
+        "pi-worker".to_string(),
+        AgentRoleConfig {
+            description: Some("Pi worker".to_string()),
+            config_file: None,
+            nickname_candidates: None,
+            runtime: Some("pi".to_string()),
+            runtime_config: None,
+        },
+    );
+
+    assert_eq!(
+        resolve_role_runtime_id(&config, Some("pi-worker")).expect("resolve Pi runtime"),
+        AgentRuntimeId::new("pi").expect("valid runtime id")
+    );
+}
+
+#[tokio::test]
 #[ignore = "No role requiring it for now"]
 async fn apply_explorer_role_sets_model_and_adds_session_flags_layer() {
     let (_home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
@@ -111,6 +141,8 @@ async fn apply_role_returns_unavailable_for_missing_user_role_file() {
             description: None,
             config_file: Some(PathBuf::from("/path/does/not/exist.toml")),
             nickname_candidates: None,
+            runtime: None,
+            runtime_config: None,
         },
     );
 
@@ -131,6 +163,8 @@ async fn apply_role_returns_unavailable_for_invalid_user_role_toml() {
             description: None,
             config_file: Some(role_path),
             nickname_candidates: None,
+            runtime: None,
+            runtime_config: None,
         },
     );
 
@@ -151,6 +185,7 @@ async fn apply_role_ignores_agent_metadata_fields_in_user_role_file() {
 name = "archivist"
 description = "Role metadata"
 nickname_candidates = ["Hypatia"]
+runtime = "pi"
 developer_instructions = "Stay focused"
 model = "role-model"
 "#,
@@ -162,6 +197,8 @@ model = "role-model"
             description: None,
             config_file: Some(role_path),
             nickname_candidates: None,
+            runtime: None,
+            runtime_config: None,
         },
     );
 
@@ -193,6 +230,8 @@ async fn apply_role_preserves_unspecified_keys() {
             description: None,
             config_file: Some(role_path),
             nickname_candidates: None,
+            runtime: None,
+            runtime_config: None,
         },
     );
 
@@ -229,6 +268,8 @@ service_tier = "priority"
             description: None,
             config_file: Some(role_path),
             nickname_candidates: None,
+            runtime: None,
+            runtime_config: None,
         },
     );
 
@@ -259,6 +300,8 @@ async fn apply_role_preserves_existing_service_tier_without_override() {
             description: None,
             config_file: Some(role_path),
             nickname_candidates: None,
+            runtime: None,
+            runtime_config: None,
         },
     );
 
@@ -303,6 +346,8 @@ writable_roots = ["./sandbox-root"]
             description: None,
             config_file: Some(role_path),
             nickname_candidates: None,
+            runtime: None,
+            runtime_config: None,
         },
     );
 
@@ -365,6 +410,8 @@ async fn apply_role_takes_precedence_over_existing_session_flags_for_same_key() 
             description: None,
             config_file: Some(role_path),
             nickname_candidates: None,
+            runtime: None,
+            runtime_config: None,
         },
     );
 
@@ -408,6 +455,8 @@ enabled = false
             description: None,
             config_file: Some(role_path),
             nickname_candidates: None,
+            runtime: None,
+            runtime_config: None,
         },
     );
 
@@ -449,6 +498,8 @@ fn spawn_tool_spec_build_deduplicates_user_defined_built_in_roles() {
                 description: Some("user override".to_string()),
                 config_file: None,
                 nickname_candidates: None,
+                runtime: None,
+                runtime_config: None,
             },
         ),
         ("researcher".to_string(), AgentRoleConfig::default()),
@@ -470,6 +521,8 @@ fn spawn_tool_spec_lists_user_defined_roles_before_built_ins() {
             description: Some("first".to_string()),
             config_file: None,
             nickname_candidates: None,
+            runtime: None,
+            runtime_config: None,
         },
     )]);
 
@@ -497,6 +550,8 @@ fn spawn_tool_spec_marks_role_locked_model_and_reasoning_effort() {
             description: Some("Research carefully.".to_string()),
             config_file: Some(role_path),
             nickname_candidates: None,
+            runtime: None,
+            runtime_config: None,
         },
     )]);
 
@@ -522,6 +577,8 @@ fn spawn_tool_spec_marks_role_locked_reasoning_effort_only() {
             description: Some("Review carefully.".to_string()),
             config_file: Some(role_path),
             nickname_candidates: None,
+            runtime: None,
+            runtime_config: None,
         },
     )]);
 
@@ -547,6 +604,8 @@ fn spawn_tool_spec_marks_role_locked_service_tier() {
             description: Some("Stay fast.".to_string()),
             config_file: Some(role_path),
             nickname_candidates: None,
+            runtime: None,
+            runtime_config: None,
         },
     )]);
 

@@ -17,6 +17,7 @@ use codex_app_server::INPUT_TOO_LARGE_ERROR_CODE;
 use codex_app_server::INVALID_PARAMS_ERROR_CODE;
 use codex_app_server_protocol::AdditionalContextEntry;
 use codex_app_server_protocol::AdditionalContextKind;
+use codex_app_server_protocol::AgentMessageDeltaNotification;
 use codex_app_server_protocol::ByteRange;
 use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::CollabAgentStatus;
@@ -47,11 +48,15 @@ use codex_app_server_protocol::ThreadDeletedNotification;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadLoadedListParams;
 use codex_app_server_protocol::ThreadLoadedListResponse;
+use codex_app_server_protocol::ThreadReadParams;
+use codex_app_server_protocol::ThreadReadResponse;
 use codex_app_server_protocol::ThreadSource;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::TurnCompletedNotification;
 use codex_app_server_protocol::TurnEnvironmentParams;
+use codex_app_server_protocol::TurnInterruptParams;
+use codex_app_server_protocol::TurnInterruptResponse;
 use codex_app_server_protocol::TurnItemsView;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
@@ -3550,6 +3555,27 @@ async fn turn_start_emits_spawn_agent_item_with_model_metadata_v2() -> Result<()
     );
     assert_eq!(agent_state.message, None);
 
+    // Characterize the native app-server contract that an external runtime adapter must
+    // preserve. Spawn completion identifies an independently addressable child thread, which
+    // then emits its own turn and item lifecycle rather than an opaque final result. The spawn
+    // path does not emit a separate `thread/started` notification for the child.
+    let child_turn_started = timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let started_notif = mcp
+                .read_stream_until_notification_message("turn/started")
+                .await?;
+            let started: TurnStartedNotification =
+                serde_json::from_value(started_notif.params.expect("turn/started params"))?;
+            if started.thread_id == receiver_thread_id {
+                return Ok::<TurnStartedNotification, anyhow::Error>(started);
+            }
+        }
+    })
+    .await??;
+    assert_eq!(child_turn_started.turn.status, TurnStatus::InProgress);
+    let child_turn_id = child_turn_started.turn.id;
+
+    // The parent is allowed to finish while its child continues independently.
     let turn_completed = timeout(DEFAULT_READ_TIMEOUT, async {
         loop {
             let turn_completed_notif = mcp
@@ -3566,6 +3592,75 @@ async fn turn_start_emits_spawn_agent_item_with_model_metadata_v2() -> Result<()
     .await??;
     assert_eq!(turn_completed.thread_id, thread.id);
     assert_eq!(turn_completed.turn.id, turn.turn.id);
+
+    let child_item_started = timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let started_notif = mcp
+                .read_stream_until_notification_message("item/started")
+                .await?;
+            let started: ItemStartedNotification = serde_json::from_value(
+                started_notif.params.expect("item/started params"),
+            )?;
+            if started.thread_id == receiver_thread_id
+                && matches!(&started.item, ThreadItem::AgentMessage { id, .. } if id == "msg-child-1")
+            {
+                return Ok::<ItemStartedNotification, anyhow::Error>(started);
+            }
+        }
+    })
+    .await??;
+    assert_eq!(child_item_started.turn_id, child_turn_id);
+    assert_eq!(
+        child_item_started.item,
+        ThreadItem::AgentMessage {
+            id: "msg-child-1".to_string(),
+            text: "child done".to_string(),
+            phase: None,
+            memory_citation: None,
+        }
+    );
+
+    let child_item_completed = timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let completed_notif = mcp
+                .read_stream_until_notification_message("item/completed")
+                .await?;
+            let completed: ItemCompletedNotification = serde_json::from_value(
+                completed_notif.params.expect("item/completed params"),
+            )?;
+            if completed.thread_id == receiver_thread_id
+                && matches!(&completed.item, ThreadItem::AgentMessage { id, .. } if id == "msg-child-1")
+            {
+                return Ok::<ItemCompletedNotification, anyhow::Error>(completed);
+            }
+        }
+    })
+    .await??;
+    assert_eq!(child_item_completed.turn_id, child_turn_id);
+    assert_eq!(
+        child_item_completed.item,
+        ThreadItem::AgentMessage {
+            id: "msg-child-1".to_string(),
+            text: "child done".to_string(),
+            phase: None,
+            memory_citation: None,
+        }
+    );
+
+    let child_turn_completed = timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let completed_notif = mcp
+                .read_stream_until_notification_message("turn/completed")
+                .await?;
+            let completed: TurnCompletedNotification =
+                serde_json::from_value(completed_notif.params.expect("turn/completed params"))?;
+            if completed.thread_id == receiver_thread_id && completed.turn.id == child_turn_id {
+                return Ok::<TurnCompletedNotification, anyhow::Error>(completed);
+            }
+        }
+    })
+    .await??;
+    assert_eq!(child_turn_completed.turn.status, TurnStatus::Completed);
 
     // Reuse this live spawn setup to cover thread/delete's ThreadManager descendant path.
     let delete_req = mcp
@@ -3609,6 +3704,1051 @@ async fn turn_start_emits_spawn_agent_item_with_model_metadata_v2() -> Result<()
     .await??;
     let ThreadLoadedListResponse { data, .. } = to_response::<ThreadLoadedListResponse>(list_resp)?;
     assert_eq!(data, Vec::<String>::new());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn fake_external_runtime_child_emits_native_app_server_events_v2() -> Result<()> {
+    assert_external_runtime_child_emits_native_app_server_events_v2(
+        "fake_worker",
+        r#"[agents.fake_worker]
+description = "Deterministic external runtime test worker"
+runtime = "fake""#,
+        "Hello from the fake external runtime.",
+        None,
+        None,
+        None,
+        None,
+        None,
+        "never",
+        true,
+        None,
+        &[("CODEX_ENABLE_FAKE_AGENT_RUNTIME_FOR_TESTS", Some("1"))],
+    )
+    .await
+}
+
+#[tokio::test]
+async fn pi_sdk_child_emits_native_app_server_events_v2() -> Result<()> {
+    let (Some(executable), Some(script)) = (
+        std::env::var_os("PI_RUNTIME_TEST_EXECUTABLE"),
+        std::env::var_os("PI_RUNTIME_TEST_SCRIPT"),
+    ) else {
+        return Ok(());
+    };
+    let executable = executable.to_string_lossy().into_owned();
+    let arguments = serde_json::to_string(&[script.to_string_lossy().into_owned()])?;
+    let faux_responses = serde_json::to_string(&json!([
+        {
+            "toolCall": {
+                "name": "exec_command",
+                "arguments": { "cmd": "printf host-bridge-ok" },
+                "id": "pi-host-exec"
+            }
+        },
+        {
+            "toolCall": {
+                "name": "apply_patch",
+                "arguments": {
+                    "patch": "*** Begin Patch\n*** Add File: pi-host-patch.txt\n+patched by pi\n*** End Patch"
+                },
+                "id": "pi-host-patch"
+            }
+        },
+        "Pi host tool completed."
+    ]))?;
+    let environment = [
+        ("CODEX_PI_RUNTIME_EXECUTABLE", Some(executable.as_str())),
+        ("CODEX_PI_RUNTIME_ARGUMENTS_JSON", Some(arguments.as_str())),
+        (
+            "PI_CODEX_RUNTIME_FAUX_RESPONSES_JSON",
+            Some(faux_responses.as_str()),
+        ),
+    ];
+    assert_external_runtime_child_emits_native_app_server_events_v2(
+        "pi_worker",
+        r#"[agents.pi_worker]
+description = "Pi SDK external runtime test worker"
+runtime = "pi"
+
+[agents.pi_worker.runtime_config]
+provider = "faux"
+model = "faux-1"
+thinking_level = "high""#,
+        "Pi host tool completed.",
+        Some((
+            "pi-host-exec",
+            "host-bridge-ok",
+            CommandExecutionStatus::Completed,
+        )),
+        Some((
+            "pi-host-patch",
+            "pi-host-patch.txt",
+            Some("patched by pi\n"),
+            PatchApplyStatus::Completed,
+        )),
+        None,
+        None,
+        None,
+        "never",
+        true,
+        None,
+        &environment,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn pi_sdk_child_routes_native_command_approval_v2() -> Result<()> {
+    let (Some(executable), Some(script)) = (
+        std::env::var_os("PI_RUNTIME_TEST_EXECUTABLE"),
+        std::env::var_os("PI_RUNTIME_TEST_SCRIPT"),
+    ) else {
+        return Ok(());
+    };
+    let executable = executable.to_string_lossy().into_owned();
+    let arguments = serde_json::to_string(&[script.to_string_lossy().into_owned()])?;
+    let faux_responses = serde_json::to_string(&json!([
+        {
+            "toolCall": {
+                "name": "exec_command",
+                "arguments": {
+                    "cmd": "python3 -c 'print(\"approved-host-command\")'"
+                },
+                "id": "pi-host-approved-exec"
+            }
+        },
+        "Pi approved host tool completed."
+    ]))?;
+    let environment = [
+        ("CODEX_PI_RUNTIME_EXECUTABLE", Some(executable.as_str())),
+        ("CODEX_PI_RUNTIME_ARGUMENTS_JSON", Some(arguments.as_str())),
+        (
+            "PI_CODEX_RUNTIME_FAUX_RESPONSES_JSON",
+            Some(faux_responses.as_str()),
+        ),
+    ];
+    assert_external_runtime_child_emits_native_app_server_events_v2(
+        "pi_worker",
+        r#"[agents.pi_worker]
+description = "Pi SDK external runtime approval test worker"
+runtime = "pi"
+
+[agents.pi_worker.runtime_config]
+provider = "faux"
+model = "faux-1""#,
+        "Pi approved host tool completed.",
+        Some((
+            "pi-host-approved-exec",
+            "approved-host-command",
+            CommandExecutionStatus::Completed,
+        )),
+        None,
+        None,
+        Some((
+            "pi-host-approved-exec",
+            CommandExecutionApprovalDecision::Accept,
+        )),
+        None,
+        "untrusted",
+        true,
+        None,
+        &environment,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn pi_sdk_child_continues_after_declined_native_command_v2() -> Result<()> {
+    let (Some(executable), Some(script)) = (
+        std::env::var_os("PI_RUNTIME_TEST_EXECUTABLE"),
+        std::env::var_os("PI_RUNTIME_TEST_SCRIPT"),
+    ) else {
+        return Ok(());
+    };
+    let executable = executable.to_string_lossy().into_owned();
+    let arguments = serde_json::to_string(&[script.to_string_lossy().into_owned()])?;
+    let faux_responses = serde_json::to_string(&json!([
+        {
+            "toolCall": {
+                "name": "exec_command",
+                "arguments": {
+                    "cmd": "python3 -c 'print(\"must-not-run\")'"
+                },
+                "id": "pi-host-declined-exec"
+            }
+        },
+        "Pi handled the declined host tool."
+    ]))?;
+    let environment = [
+        ("CODEX_PI_RUNTIME_EXECUTABLE", Some(executable.as_str())),
+        ("CODEX_PI_RUNTIME_ARGUMENTS_JSON", Some(arguments.as_str())),
+        (
+            "PI_CODEX_RUNTIME_FAUX_RESPONSES_JSON",
+            Some(faux_responses.as_str()),
+        ),
+    ];
+    assert_external_runtime_child_emits_native_app_server_events_v2(
+        "pi_worker",
+        r#"[agents.pi_worker]
+description = "Pi SDK external runtime declined approval test worker"
+runtime = "pi"
+
+[agents.pi_worker.runtime_config]
+provider = "faux"
+model = "faux-1""#,
+        "Pi handled the declined host tool.",
+        Some((
+            "pi-host-declined-exec",
+            "",
+            CommandExecutionStatus::Declined,
+        )),
+        None,
+        None,
+        Some((
+            "pi-host-declined-exec",
+            CommandExecutionApprovalDecision::Cancel,
+        )),
+        None,
+        "untrusted",
+        true,
+        None,
+        &environment,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn pi_sdk_child_inherits_read_only_sandbox_v2() -> Result<()> {
+    let (Some(executable), Some(script)) = (
+        std::env::var_os("PI_RUNTIME_TEST_EXECUTABLE"),
+        std::env::var_os("PI_RUNTIME_TEST_SCRIPT"),
+    ) else {
+        return Ok(());
+    };
+    let executable = executable.to_string_lossy().into_owned();
+    let arguments = serde_json::to_string(&[script.to_string_lossy().into_owned()])?;
+    let faux_responses = serde_json::to_string(&json!([
+        {
+            "toolCall": {
+                "name": "exec_command",
+                "arguments": {
+                    "cmd": "printf blocked > pi-must-not-write.txt"
+                },
+                "id": "pi-host-read-only-exec"
+            }
+        },
+        "Pi handled the sandbox denial."
+    ]))?;
+    let environment = [
+        ("CODEX_PI_RUNTIME_EXECUTABLE", Some(executable.as_str())),
+        ("CODEX_PI_RUNTIME_ARGUMENTS_JSON", Some(arguments.as_str())),
+        (
+            "PI_CODEX_RUNTIME_FAUX_RESPONSES_JSON",
+            Some(faux_responses.as_str()),
+        ),
+    ];
+    assert_external_runtime_child_emits_native_app_server_events_v2(
+        "pi_worker",
+        r#"[agents.pi_worker]
+description = "Pi SDK external runtime read-only sandbox test worker"
+runtime = "pi"
+
+[agents.pi_worker.runtime_config]
+provider = "faux"
+        model = "faux-1""#,
+        "Pi handled the sandbox denial.",
+        None,
+        None,
+        Some("pi-must-not-write.txt"),
+        None,
+        None,
+        "never",
+        false,
+        None,
+        &environment,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn pi_sdk_child_inherits_network_denial_v2() -> Result<()> {
+    let (Some(executable), Some(script)) = (
+        std::env::var_os("PI_RUNTIME_TEST_EXECUTABLE"),
+        std::env::var_os("PI_RUNTIME_TEST_SCRIPT"),
+    ) else {
+        return Ok(());
+    };
+    let executable = executable.to_string_lossy().into_owned();
+    let arguments = serde_json::to_string(&[script.to_string_lossy().into_owned()])?;
+    let faux_responses = serde_json::to_string(&json!([
+        {
+            "toolCall": {
+                "name": "exec_command",
+                "arguments": {
+                    "cmd": "python3 -c 'import socket,time; time.sleep(0.25); socket.create_connection((\"1.1.1.1\", 80), 1)'"
+                },
+                "id": "pi-host-network-denied"
+            }
+        },
+        "Pi handled the network denial."
+    ]))?;
+    let environment = [
+        ("CODEX_PI_RUNTIME_EXECUTABLE", Some(executable.as_str())),
+        ("CODEX_PI_RUNTIME_ARGUMENTS_JSON", Some(arguments.as_str())),
+        (
+            "PI_CODEX_RUNTIME_FAUX_RESPONSES_JSON",
+            Some(faux_responses.as_str()),
+        ),
+    ];
+    assert_external_runtime_child_emits_native_app_server_events_v2(
+        "pi_worker",
+        r#"[agents.pi_worker]
+description = "Pi SDK external runtime network sandbox test worker"
+runtime = "pi"
+
+[agents.pi_worker.runtime_config]
+provider = "faux"
+model = "faux-1""#,
+        "Pi handled the network denial.",
+        Some(("pi-host-network-denied", "", CommandExecutionStatus::Failed)),
+        None,
+        None,
+        None,
+        None,
+        "never",
+        true,
+        None,
+        &environment,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn pi_sdk_child_interrupt_cancels_native_host_command_v2() -> Result<()> {
+    let (Some(executable), Some(script)) = (
+        std::env::var_os("PI_RUNTIME_TEST_EXECUTABLE"),
+        std::env::var_os("PI_RUNTIME_TEST_SCRIPT"),
+    ) else {
+        return Ok(());
+    };
+    let executable = executable.to_string_lossy().into_owned();
+    let arguments = serde_json::to_string(&[script.to_string_lossy().into_owned()])?;
+    let faux_responses = serde_json::to_string(&json!([
+        {
+            "toolCall": {
+                "name": "exec_command",
+                "arguments": {
+                    "cmd": "sleep 60; printf must-not-exist > pi-interrupt-marker.txt"
+                },
+                "id": "pi-host-interrupted-exec"
+            }
+        },
+        "Pi must not reach this final response."
+    ]))?;
+    let environment = [
+        ("CODEX_PI_RUNTIME_EXECUTABLE", Some(executable.as_str())),
+        ("CODEX_PI_RUNTIME_ARGUMENTS_JSON", Some(arguments.as_str())),
+        (
+            "PI_CODEX_RUNTIME_FAUX_RESPONSES_JSON",
+            Some(faux_responses.as_str()),
+        ),
+    ];
+    assert_external_runtime_child_emits_native_app_server_events_v2(
+        "pi_worker",
+        r#"[agents.pi_worker]
+description = "Pi SDK external runtime interruption test worker"
+runtime = "pi"
+
+[agents.pi_worker.runtime_config]
+provider = "faux"
+model = "faux-1""#,
+        "",
+        Some((
+            "pi-host-interrupted-exec",
+            "",
+            CommandExecutionStatus::Failed,
+        )),
+        None,
+        Some("pi-interrupt-marker.txt"),
+        None,
+        None,
+        "never",
+        true,
+        Some("pi-host-interrupted-exec"),
+        &environment,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn pi_sdk_child_routes_native_patch_approval_v2() -> Result<()> {
+    let (Some(executable), Some(script)) = (
+        std::env::var_os("PI_RUNTIME_TEST_EXECUTABLE"),
+        std::env::var_os("PI_RUNTIME_TEST_SCRIPT"),
+    ) else {
+        return Ok(());
+    };
+    let executable = executable.to_string_lossy().into_owned();
+    let arguments = serde_json::to_string(&[script.to_string_lossy().into_owned()])?;
+    let faux_responses = serde_json::to_string(&json!([
+        {
+            "toolCall": {
+                "name": "apply_patch",
+                "arguments": {
+                    "patch": "*** Begin Patch\n*** Add File: pi-approved-patch.txt\n+approved patch\n*** End Patch"
+                },
+                "id": "pi-host-approved-patch"
+            }
+        },
+        "Pi approved patch completed."
+    ]))?;
+    let environment = [
+        ("CODEX_PI_RUNTIME_EXECUTABLE", Some(executable.as_str())),
+        ("CODEX_PI_RUNTIME_ARGUMENTS_JSON", Some(arguments.as_str())),
+        (
+            "PI_CODEX_RUNTIME_FAUX_RESPONSES_JSON",
+            Some(faux_responses.as_str()),
+        ),
+    ];
+    assert_external_runtime_child_emits_native_app_server_events_v2(
+        "pi_worker",
+        r#"[agents.pi_worker]
+description = "Pi SDK external runtime patch approval test worker"
+runtime = "pi"
+
+[agents.pi_worker.runtime_config]
+provider = "faux"
+model = "faux-1""#,
+        "Pi approved patch completed.",
+        None,
+        Some((
+            "pi-host-approved-patch",
+            "pi-approved-patch.txt",
+            Some("approved patch\n"),
+            PatchApplyStatus::Completed,
+        )),
+        None,
+        None,
+        Some(("pi-host-approved-patch", FileChangeApprovalDecision::Accept)),
+        "untrusted",
+        true,
+        None,
+        &environment,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn pi_sdk_child_continues_after_declined_native_patch_v2() -> Result<()> {
+    let (Some(executable), Some(script)) = (
+        std::env::var_os("PI_RUNTIME_TEST_EXECUTABLE"),
+        std::env::var_os("PI_RUNTIME_TEST_SCRIPT"),
+    ) else {
+        return Ok(());
+    };
+    let executable = executable.to_string_lossy().into_owned();
+    let arguments = serde_json::to_string(&[script.to_string_lossy().into_owned()])?;
+    let faux_responses = serde_json::to_string(&json!([
+        {
+            "toolCall": {
+                "name": "apply_patch",
+                "arguments": {
+                    "patch": "*** Begin Patch\n*** Add File: pi-declined-patch.txt\n+must not exist\n*** End Patch"
+                },
+                "id": "pi-host-declined-patch"
+            }
+        },
+        "Pi handled the declined patch."
+    ]))?;
+    let environment = [
+        ("CODEX_PI_RUNTIME_EXECUTABLE", Some(executable.as_str())),
+        ("CODEX_PI_RUNTIME_ARGUMENTS_JSON", Some(arguments.as_str())),
+        (
+            "PI_CODEX_RUNTIME_FAUX_RESPONSES_JSON",
+            Some(faux_responses.as_str()),
+        ),
+    ];
+    assert_external_runtime_child_emits_native_app_server_events_v2(
+        "pi_worker",
+        r#"[agents.pi_worker]
+description = "Pi SDK external runtime declined patch test worker"
+runtime = "pi"
+
+[agents.pi_worker.runtime_config]
+provider = "faux"
+model = "faux-1""#,
+        "Pi handled the declined patch.",
+        None,
+        Some((
+            "pi-host-declined-patch",
+            "pi-declined-patch.txt",
+            None,
+            PatchApplyStatus::Declined,
+        )),
+        Some("pi-declined-patch.txt"),
+        None,
+        Some((
+            "pi-host-declined-patch",
+            FileChangeApprovalDecision::Decline,
+        )),
+        "untrusted",
+        true,
+        None,
+        &environment,
+    )
+    .await
+}
+
+async fn assert_external_runtime_child_emits_native_app_server_events_v2(
+    agent_type: &str,
+    agent_config: &str,
+    expected_message: &str,
+    expected_command: Option<(&str, &str, CommandExecutionStatus)>,
+    expected_patch: Option<(&str, &str, Option<&str>, PatchApplyStatus)>,
+    expected_missing_file: Option<&str>,
+    expected_command_approval: Option<(&str, CommandExecutionApprovalDecision)>,
+    expected_patch_approval: Option<(&str, FileChangeApprovalDecision)>,
+    approval_policy: &str,
+    workspace_write: bool,
+    interrupt_after_command_start: Option<&str>,
+    environment: &[(&str, Option<&str>)],
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    const CHILD_PROMPT: &str = "child: run outside Codex";
+    const PARENT_PROMPT: &str = "spawn the fake external child";
+    const SPAWN_CALL_ID: &str = "spawn-fake-runtime";
+
+    let server = responses::start_mock_server().await;
+    let spawn_args = serde_json::to_string(&json!({
+        "message": CHILD_PROMPT,
+        "agent_type": agent_type,
+    }))?;
+    let _parent_turn = responses::mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| body_contains(req, PARENT_PROMPT),
+        responses::sse(vec![
+            responses::ev_response_created("resp-fake-parent-1"),
+            responses::ev_function_call_with_namespace(
+                SPAWN_CALL_ID,
+                "multi_agent_v1",
+                "spawn_agent",
+                &spawn_args,
+            ),
+            responses::ev_completed("resp-fake-parent-1"),
+        ]),
+    )
+    .await;
+    let _parent_follow_up = responses::mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| body_contains(req, SPAWN_CALL_ID),
+        responses::sse(vec![
+            responses::ev_response_created("resp-fake-parent-2"),
+            responses::ev_assistant_message("msg-fake-parent", "parent done"),
+            responses::ev_completed("resp-fake-parent-2"),
+        ]),
+    )
+    .await;
+
+    let codex_home = TempDir::new()?;
+    let workspace = TempDir::new()?;
+    create_config_toml(
+        codex_home.path(),
+        &server.uri(),
+        approval_policy,
+        &BTreeMap::from([(Feature::Collab, true)]),
+    )?;
+    let config_path = codex_home.path().join("config.toml");
+    let base_config = std::fs::read_to_string(&config_path)?;
+    std::fs::write(&config_path, format!("{base_config}\n\n{agent_config}\n"))?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .with_env_overrides(environment)
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let thread_req = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
+            model: Some("gpt-5.4".to_string()),
+            cwd: Some(workspace.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        })
+        .await?;
+    let thread_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(thread_req)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(thread_resp)?;
+
+    let turn_req = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![V2UserInput::Text {
+                text: PARENT_PROMPT.to_string(),
+                text_elements: Vec::new(),
+            }],
+            cwd: Some(workspace.path().to_path_buf()),
+            sandbox_policy: Some(if workspace_write {
+                codex_app_server_protocol::SandboxPolicy::WorkspaceWrite {
+                    writable_roots: vec![workspace.path().try_into()?],
+                    network_access: false,
+                    exclude_tmpdir_env_var: true,
+                    exclude_slash_tmp: true,
+                }
+            } else {
+                codex_app_server_protocol::SandboxPolicy::ReadOnly {
+                    network_access: false,
+                }
+            }),
+            ..Default::default()
+        })
+        .await?;
+    let turn_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
+    )
+    .await??;
+    let _: TurnStartResponse = to_response::<TurnStartResponse>(turn_resp)?;
+
+    let (spawn_completed, early_item_completions) = timeout(DEFAULT_READ_TIMEOUT, async {
+        let mut early_item_completions = Vec::new();
+        loop {
+            let notification = mcp
+                .read_stream_until_notification_message("item/completed")
+                .await?;
+            let completed: ItemCompletedNotification =
+                serde_json::from_value(notification.params.expect("item/completed params"))?;
+            if matches!(&completed.item, ThreadItem::CollabAgentToolCall { id, .. } if id == SPAWN_CALL_ID)
+            {
+                return Ok::<(ThreadItem, Vec<ItemCompletedNotification>), anyhow::Error>((
+                    completed.item,
+                    early_item_completions,
+                ));
+            }
+            early_item_completions.push(completed);
+        }
+    })
+    .await??;
+    let ThreadItem::CollabAgentToolCall {
+        receiver_thread_ids,
+        status,
+        ..
+    } = spawn_completed
+    else {
+        unreachable!("loop only returns the spawn tool item");
+    };
+    assert_eq!(status, CollabAgentToolCallStatus::Completed);
+    let child_thread_id = receiver_thread_ids
+        .first()
+        .cloned()
+        .expect("fake runtime spawn should expose its child thread id");
+
+    let child_turn_started = timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let notification = mcp
+                .read_stream_until_notification_message("turn/started")
+                .await?;
+            let started: TurnStartedNotification =
+                serde_json::from_value(notification.params.expect("turn/started params"))?;
+            if started.thread_id == child_thread_id {
+                return Ok::<TurnStartedNotification, anyhow::Error>(started);
+            }
+        }
+    })
+    .await??;
+    assert_eq!(child_turn_started.turn.status, TurnStatus::InProgress);
+    let child_turn_id = child_turn_started.turn.id;
+
+    let (child_item_started, mut child_command_started, mut child_patch_started) =
+        timeout(DEFAULT_READ_TIMEOUT, async {
+            let mut child_command_started = None;
+            let mut child_patch_started = None;
+            let mut pending_command_approval = expected_command_approval;
+            let mut pending_patch_approval = expected_patch_approval;
+            loop {
+                let notification = mcp
+                    .read_stream_until_notification_message("item/started")
+                    .await?;
+                let started: ItemStartedNotification =
+                    serde_json::from_value(notification.params.expect("item/started params"))?;
+                if started.thread_id == child_thread_id
+                    && matches!(&started.item, ThreadItem::AgentMessage { .. })
+                {
+                    return Ok::<_, anyhow::Error>((
+                        Some(started),
+                        child_command_started,
+                        child_patch_started,
+                    ));
+                }
+                if started.thread_id == child_thread_id
+                    && matches!(&started.item, ThreadItem::CommandExecution { .. })
+                {
+                    if let Some((expected_id, decision)) = pending_command_approval.take() {
+                        let server_req = mcp.read_stream_until_request_message().await?;
+                        let ServerRequest::CommandExecutionRequestApproval { request_id, params } =
+                            server_req
+                        else {
+                            panic!("expected CommandExecutionRequestApproval request")
+                        };
+                        let ThreadItem::CommandExecution { ref id, .. } = started.item else {
+                            unreachable!("branch only accepts command execution items")
+                        };
+                        assert_eq!(params.thread_id, child_thread_id);
+                        assert_eq!(params.turn_id, child_turn_id);
+                        assert_eq!(params.item_id, *id);
+                        assert_eq!(params.item_id, expected_id);
+                        mcp.send_response(
+                            request_id,
+                            serde_json::to_value(CommandExecutionRequestApprovalResponse {
+                                decision,
+                            })?,
+                        )
+                        .await?;
+                    }
+                    child_command_started = Some(started);
+                    if matches!(
+                        (&child_command_started, interrupt_after_command_start),
+                        (
+                            Some(ItemStartedNotification {
+                                item: ThreadItem::CommandExecution { id, .. },
+                                ..
+                            }),
+                            Some(expected_id)
+                        ) if id == expected_id
+                    ) {
+                        return Ok::<_, anyhow::Error>((
+                            None,
+                            child_command_started,
+                            child_patch_started,
+                        ));
+                    }
+                } else if started.thread_id == child_thread_id
+                    && matches!(&started.item, ThreadItem::FileChange { .. })
+                {
+                    if let Some((expected_id, decision)) = pending_patch_approval.take() {
+                        let server_req = mcp.read_stream_until_request_message().await?;
+                        let ServerRequest::FileChangeRequestApproval { request_id, params } =
+                            server_req
+                        else {
+                            panic!("expected FileChangeRequestApproval request")
+                        };
+                        let ThreadItem::FileChange { ref id, .. } = started.item else {
+                            unreachable!("branch only accepts file change items")
+                        };
+                        assert_eq!(params.thread_id, child_thread_id);
+                        assert_eq!(params.turn_id, child_turn_id);
+                        assert_eq!(params.item_id, *id);
+                        assert_eq!(params.item_id, expected_id);
+                        mcp.send_response(
+                            request_id,
+                            serde_json::to_value(FileChangeRequestApprovalResponse { decision })?,
+                        )
+                        .await?;
+                    }
+                    child_patch_started = Some(started);
+                }
+            }
+        })
+        .await??;
+    if child_item_started.is_none() {
+        let interrupt_id = mcp
+            .send_turn_interrupt_request(TurnInterruptParams {
+                thread_id: child_thread_id.clone(),
+                turn_id: child_turn_id.clone(),
+            })
+            .await?;
+        let interrupt_response: JSONRPCResponse = timeout(
+            std::time::Duration::from_secs(25),
+            mcp.read_stream_until_response_message(RequestId::Integer(interrupt_id)),
+        )
+        .await??;
+        let _: TurnInterruptResponse = to_response::<TurnInterruptResponse>(interrupt_response)?;
+        let completed = timeout(DEFAULT_READ_TIMEOUT, async {
+            loop {
+                let notification = mcp
+                    .read_stream_until_notification_message("turn/completed")
+                    .await?;
+                let completed: TurnCompletedNotification =
+                    serde_json::from_value(notification.params.expect("turn/completed params"))?;
+                if completed.thread_id == child_thread_id && completed.turn.id == child_turn_id {
+                    return Ok::<TurnCompletedNotification, anyhow::Error>(completed);
+                }
+            }
+        })
+        .await??;
+        assert_eq!(completed.turn.status, TurnStatus::Interrupted);
+        if let Some(expected_missing_file) = expected_missing_file {
+            assert!(!workspace.path().join(expected_missing_file).exists());
+        }
+        return Ok(());
+    }
+    let child_item_started = child_item_started.expect("checked above");
+    assert_eq!(child_item_started.turn_id, child_turn_id);
+    let ThreadItem::AgentMessage { id: item_id, .. } = child_item_started.item else {
+        unreachable!("loop only returns an agent message item");
+    };
+    if expected_command.is_some() && child_command_started.is_none() {
+        child_command_started = Some(
+            timeout(DEFAULT_READ_TIMEOUT, async {
+                loop {
+                    let notification = mcp
+                        .read_stream_until_notification_message("item/started")
+                        .await?;
+                    let started: ItemStartedNotification =
+                        serde_json::from_value(notification.params.expect("item/started params"))?;
+                    if started.thread_id == child_thread_id
+                        && matches!(&started.item, ThreadItem::CommandExecution { .. })
+                    {
+                        return Ok::<ItemStartedNotification, anyhow::Error>(started);
+                    }
+                }
+            })
+            .await??,
+        );
+    }
+    match (expected_command.clone(), child_command_started) {
+        (Some((expected_id, _, _)), Some(started)) => {
+            assert_eq!(started.turn_id, child_turn_id);
+            assert!(
+                matches!(started.item, ThreadItem::CommandExecution { id, status: CommandExecutionStatus::InProgress, .. } if id == expected_id)
+            );
+        }
+        (Some(_), None) => panic!("expected a Codex-hosted command item"),
+        (None, _) => {}
+    }
+    if expected_patch.is_some() && child_patch_started.is_none() {
+        child_patch_started = Some(
+            timeout(DEFAULT_READ_TIMEOUT, async {
+                loop {
+                    let notification = mcp
+                        .read_stream_until_notification_message("item/started")
+                        .await?;
+                    let started: ItemStartedNotification =
+                        serde_json::from_value(notification.params.expect("item/started params"))?;
+                    if started.thread_id == child_thread_id
+                        && matches!(&started.item, ThreadItem::FileChange { .. })
+                    {
+                        return Ok::<ItemStartedNotification, anyhow::Error>(started);
+                    }
+                }
+            })
+            .await??,
+        );
+    }
+    match (expected_patch.clone(), child_patch_started) {
+        (Some((expected_id, expected_path, _, _)), Some(started)) => {
+            assert_eq!(started.turn_id, child_turn_id);
+            assert!(matches!(
+                started.item,
+                ThreadItem::FileChange { id, status: PatchApplyStatus::InProgress, changes }
+                    if id == expected_id
+                        && changes.iter().any(|change| change.path.ends_with(expected_path))
+            ));
+        }
+        (Some(_), None) => panic!("expected a Codex-hosted file change item"),
+        (None, _) => {}
+    }
+
+    let delta_notification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("item/agentMessage/delta"),
+    )
+    .await??;
+    let delta: AgentMessageDeltaNotification = serde_json::from_value(
+        delta_notification
+            .params
+            .expect("item/agentMessage/delta params"),
+    )?;
+    assert_eq!(delta.thread_id, child_thread_id);
+    assert_eq!(delta.turn_id, child_turn_id);
+    assert_eq!(delta.item_id, item_id);
+    assert!(!delta.delta.is_empty());
+
+    let (child_item_completed, mut child_command_completed, mut child_patch_completed) = match early_item_completions.into_iter().find(|completed| {
+        completed.thread_id == child_thread_id
+            && matches!(&completed.item, ThreadItem::AgentMessage { id, .. } if id == &item_id)
+    }) {
+        Some(completed) => (completed, None, None),
+        None => timeout(DEFAULT_READ_TIMEOUT, async {
+            let mut child_command_completed = None;
+            let mut child_patch_completed = None;
+            loop {
+                let notification = mcp
+                    .read_stream_until_notification_message("item/completed")
+                    .await?;
+                let completed: ItemCompletedNotification =
+                    serde_json::from_value(notification.params.expect("item/completed params"))?;
+                if completed.thread_id == child_thread_id
+                    && matches!(&completed.item, ThreadItem::AgentMessage { id, .. } if id == &item_id)
+                {
+                    return Ok::<_, anyhow::Error>((
+                        completed,
+                        child_command_completed,
+                        child_patch_completed,
+                    ));
+                }
+                if completed.thread_id == child_thread_id
+                    && matches!(&completed.item, ThreadItem::CommandExecution { .. })
+                {
+                    child_command_completed = Some(completed);
+                }
+                else if completed.thread_id == child_thread_id
+                    && matches!(&completed.item, ThreadItem::FileChange { .. })
+                {
+                    child_patch_completed = Some(completed);
+                }
+            }
+        })
+        .await??,
+    };
+    assert_eq!(child_item_completed.turn_id, child_turn_id);
+    assert!(matches!(
+        child_item_completed.item,
+        ThreadItem::AgentMessage { text, .. } if text == expected_message
+    ));
+    if expected_command.is_some() && child_command_completed.is_none() {
+        child_command_completed = Some(
+            timeout(DEFAULT_READ_TIMEOUT, async {
+                loop {
+                    let notification = mcp
+                        .read_stream_until_notification_message("item/completed")
+                        .await?;
+                    let completed: ItemCompletedNotification = serde_json::from_value(
+                        notification.params.expect("item/completed params"),
+                    )?;
+                    if completed.thread_id == child_thread_id
+                        && matches!(&completed.item, ThreadItem::CommandExecution { .. })
+                    {
+                        return Ok::<ItemCompletedNotification, anyhow::Error>(completed);
+                    }
+                }
+            })
+            .await??,
+        );
+    }
+    match (expected_command, child_command_completed) {
+        (Some((expected_id, expected_output, expected_status)), Some(completed)) => {
+            assert_eq!(completed.turn_id, child_turn_id);
+            let ThreadItem::CommandExecution {
+                id,
+                status,
+                aggregated_output,
+                ..
+            } = completed.item
+            else {
+                unreachable!("branch only accepts command execution items")
+            };
+            assert_eq!(id, expected_id);
+            assert_eq!(status, expected_status);
+            if !expected_output.is_empty() {
+                assert!(
+                    aggregated_output
+                        .as_deref()
+                        .is_some_and(|output| output.contains(expected_output))
+                );
+            }
+        }
+        (Some(_), None) => panic!("expected a completed Codex-hosted command item"),
+        (None, _) => {}
+    }
+    if expected_patch.is_some() && child_patch_completed.is_none() {
+        child_patch_completed = Some(
+            timeout(DEFAULT_READ_TIMEOUT, async {
+                loop {
+                    let notification = mcp
+                        .read_stream_until_notification_message("item/completed")
+                        .await?;
+                    let completed: ItemCompletedNotification = serde_json::from_value(
+                        notification.params.expect("item/completed params"),
+                    )?;
+                    if completed.thread_id == child_thread_id
+                        && matches!(&completed.item, ThreadItem::FileChange { .. })
+                    {
+                        return Ok::<ItemCompletedNotification, anyhow::Error>(completed);
+                    }
+                }
+            })
+            .await??,
+        );
+    }
+    match (expected_patch, child_patch_completed) {
+        (
+            Some((expected_id, expected_path, expected_contents, expected_status)),
+            Some(completed),
+        ) => {
+            assert_eq!(completed.turn_id, child_turn_id);
+            assert!(matches!(
+                completed.item,
+                ThreadItem::FileChange { id, status, changes }
+                    if id == expected_id
+                        && status == expected_status
+                        && changes.iter().any(|change| change.path.ends_with(expected_path))
+            ));
+            if let Some(expected_contents) = expected_contents {
+                assert_eq!(
+                    std::fs::read_to_string(workspace.path().join(expected_path))?,
+                    expected_contents
+                );
+            }
+        }
+        (Some(_), None) => panic!("expected a completed Codex-hosted file change item"),
+        (None, _) => {}
+    }
+
+    let child_turn_completed = timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let notification = mcp
+                .read_stream_until_notification_message("turn/completed")
+                .await?;
+            let completed: TurnCompletedNotification =
+                serde_json::from_value(notification.params.expect("turn/completed params"))?;
+            if completed.thread_id == child_thread_id && completed.turn.id == child_turn_id {
+                return Ok::<TurnCompletedNotification, anyhow::Error>(completed);
+            }
+        }
+    })
+    .await??;
+    assert_eq!(child_turn_completed.turn.status, TurnStatus::Completed);
+
+    let read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: child_thread_id.clone(),
+            include_turns: true,
+        })
+        .await?;
+    let read_response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
+    )
+    .await??;
+    let ThreadReadResponse {
+        thread: child_thread,
+    } = to_response::<ThreadReadResponse>(read_response)?;
+    assert_eq!(child_thread.id, child_thread_id);
+    assert_eq!(
+        child_thread.parent_thread_id.as_deref(),
+        Some(thread.id.as_str())
+    );
+    assert_eq!(child_thread.agent_role.as_deref(), Some(agent_type));
+    if agent_type == "pi_worker" {
+        assert_eq!(child_thread.model_provider, "faux");
+    }
+    assert!(
+        child_thread.turns.iter().any(|turn| {
+            turn.items.iter().any(|item| {
+                matches!(item, ThreadItem::AgentMessage { text, .. } if text == expected_message)
+            })
+        }),
+        "thread/read should reconstruct the external agent message from durable history"
+    );
+    if let Some(expected_missing_file) = expected_missing_file {
+        assert!(!workspace.path().join(expected_missing_file).exists());
+    }
 
     Ok(())
 }

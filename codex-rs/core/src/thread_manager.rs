@@ -1,5 +1,7 @@
 use crate::SkillsService;
 use crate::agent::AgentControl;
+use crate::agent::AgentRuntimeRegistry;
+use crate::agent::ResolvedAgentRuntime;
 use crate::attestation::AttestationProvider;
 use crate::codex_thread::CodexThread;
 use crate::config::Config;
@@ -7,6 +9,8 @@ use crate::config::ThreadStoreConfig;
 use crate::current_time::TimeProvider;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::environment_selection::default_thread_environment_selections;
+use crate::external_host_tools::ExternalHostTools;
+use crate::managed_agent_thread::ManagedAgentThread;
 use crate::mcp::McpManager;
 use crate::rollout::truncation;
 use crate::session::Codex;
@@ -26,6 +30,12 @@ use codex_code_mode::InProcessCodeModeSessionProvider;
 use codex_code_mode::ProcessOwnedCodeModeSessionProvider;
 use codex_core_plugins::PluginsManager;
 use codex_exec_server::EnvironmentManager;
+use codex_extension_api::AgentRuntimeError;
+use codex_extension_api::AgentRuntimeId;
+use codex_extension_api::AgentRuntimePersistence;
+use codex_extension_api::AgentRuntimeProvider;
+use codex_extension_api::AgentRuntimeResumeRequest;
+use codex_extension_api::AgentRuntimeSpawnRequest;
 use codex_extension_api::ExtensionDataInit;
 use codex_extension_api::ExtensionRegistry;
 use codex_extension_api::LoadedUserInstructions;
@@ -45,9 +55,11 @@ use codex_protocol::ThreadId;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
+use codex_protocol::models::BaseInstructions;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ExternalRuntimeState;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::Op;
@@ -57,19 +69,24 @@ use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_rollout::state_db::StateDbHandle;
+use codex_thread_store::CreateThreadParams;
 use codex_thread_store::InMemoryThreadStore;
+use codex_thread_store::LiveThread;
 use codex_thread_store::LocalThreadStore;
 use codex_thread_store::LocalThreadStoreConfig;
 use codex_thread_store::ReadThreadByRolloutPathParams;
 use codex_thread_store::ReadThreadParams;
+use codex_thread_store::ResumeThreadParams;
 use codex_thread_store::StoredThread;
 use codex_thread_store::ThreadMetadataPatch;
+use codex_thread_store::ThreadPersistenceMetadata;
 use codex_thread_store::ThreadStore;
 use codex_thread_store::ThreadStoreError;
 use codex_thread_store::UpdateThreadMetadataParams;
@@ -233,11 +250,17 @@ pub(crate) struct ResumeThreadWithHistoryOptions {
     pub(crate) inherited_exec_policy: Option<Arc<crate::exec_policy::ExecPolicyManager>>,
 }
 
+pub(crate) struct ResumedManagedThread {
+    pub(crate) thread_id: ThreadId,
+    pub(crate) thread: Arc<ManagedAgentThread>,
+}
+
 /// Shared, `Arc`-owned state for [`ThreadManager`]. This `Arc` is required to have a single
 /// `Arc` reference that can be downgraded to by `AgentControl` while preventing every single
 /// function to require an `Arc<&Self>`.
 pub(crate) struct ThreadManagerState {
-    threads: Arc<RwLock<HashMap<ThreadId, Arc<CodexThread>>>>,
+    threads: Arc<RwLock<HashMap<ThreadId, Arc<ManagedAgentThread>>>>,
+    agent_runtime_registry: AgentRuntimeRegistry,
     thread_created_tx: broadcast::Sender<ThreadId>,
     auth_manager: Arc<AuthManager>,
     models_manager: SharedModelsManager,
@@ -336,6 +359,7 @@ impl ThreadManager {
         Self {
             state: Arc::new(ThreadManagerState {
                 threads: Arc::new(RwLock::new(HashMap::new())),
+                agent_runtime_registry: AgentRuntimeRegistry::default(),
                 thread_created_tx,
                 models_manager: build_models_manager(config, auth_manager.clone()),
                 environment_manager,
@@ -455,6 +479,7 @@ impl ThreadManager {
         Self {
             state: Arc::new(ThreadManagerState {
                 threads: Arc::new(RwLock::new(HashMap::new())),
+                agent_runtime_registry: AgentRuntimeRegistry::default(),
                 thread_created_tx,
                 models_manager: create_model_provider(provider, Some(auth_manager.clone()))
                     .models_manager(codex_home, /*config_model_catalog*/ None),
@@ -484,6 +509,13 @@ impl ThreadManager {
 
     pub fn session_source(&self) -> SessionSource {
         self.state.session_source.clone()
+    }
+
+    pub fn register_agent_runtime_provider(
+        &self,
+        provider: Arc<dyn AgentRuntimeProvider>,
+    ) -> Result<(), AgentRuntimeError> {
+        self.state.agent_runtime_registry.register(provider)
     }
 
     pub fn auth_manager(&self) -> Arc<AuthManager> {
@@ -566,6 +598,13 @@ impl ThreadManager {
     }
 
     pub async fn get_thread(&self, thread_id: ThreadId) -> CodexResult<Arc<CodexThread>> {
+        self.state.get_native_thread(thread_id).await
+    }
+
+    pub async fn get_managed_thread(
+        &self,
+        thread_id: ThreadId,
+    ) -> CodexResult<Arc<ManagedAgentThread>> {
         self.state.get_thread(thread_id).await
     }
 
@@ -892,6 +931,18 @@ impl ThreadManager {
     /// as `Arc<CodexThread>`, it is possible that other references to it exist elsewhere.
     /// Returns the thread if the thread was found and removed.
     pub async fn remove_thread(&self, thread_id: &ThreadId) -> Option<Arc<CodexThread>> {
+        self.state
+            .threads
+            .write()
+            .await
+            .remove(thread_id)
+            .and_then(|thread| thread.as_codex_thread().cloned())
+    }
+
+    pub async fn remove_managed_thread(
+        &self,
+        thread_id: &ThreadId,
+    ) -> Option<Arc<ManagedAgentThread>> {
         self.state.threads.write().await.remove(thread_id)
     }
 
@@ -1088,6 +1139,468 @@ impl ThreadManager {
 }
 
 impl ThreadManagerState {
+    pub(crate) fn resolve_agent_runtime(
+        &self,
+        runtime_id: &AgentRuntimeId,
+    ) -> Result<ResolvedAgentRuntime, AgentRuntimeError> {
+        self.agent_runtime_registry.resolve(runtime_id)
+    }
+
+    pub(crate) async fn spawn_external_agent_thread(
+        self: &Arc<Self>,
+        provider: Arc<dyn AgentRuntimeProvider>,
+        config: &Config,
+        session_source: SessionSource,
+        multi_agent_version: MultiAgentVersion,
+        environments: Option<Vec<TurnEnvironmentSelection>>,
+    ) -> CodexResult<ThreadId> {
+        let parent_thread_id = session_source.parent_thread_id().ok_or_else(|| {
+            CodexErr::UnsupportedOperation(
+                "external agent runtimes currently require a parent thread".to_string(),
+            )
+        })?;
+        let parent_thread = self.get_thread(parent_thread_id).await?;
+        let mut config_snapshot = parent_thread.config_snapshot().await;
+        let thread_id = ThreadId::new();
+        let model = config
+            .model
+            .clone()
+            .unwrap_or_else(|| config_snapshot.model.clone());
+
+        config_snapshot.model = model.clone();
+        config_snapshot.model_provider_id = config.model_provider_id.clone();
+        config_snapshot.service_tier = config.service_tier.clone();
+        config_snapshot.approval_policy = config.permissions.approval_policy.value();
+        config_snapshot.approvals_reviewer = config.approvals_reviewer;
+        config_snapshot.permission_profile = config.permissions.effective_permission_profile();
+        config_snapshot.active_permission_profile = config.permissions.active_permission_profile();
+        config_snapshot.workspace_roots = config.workspace_roots.clone();
+        config_snapshot.profile_workspace_roots =
+            config.permissions.profile_workspace_roots().to_vec();
+        config_snapshot.ephemeral = config.ephemeral;
+        config_snapshot.reasoning_effort = config.model_reasoning_effort.clone();
+        config_snapshot.reasoning_summary = config.model_reasoning_summary;
+        config_snapshot.personality = config.personality;
+        config_snapshot.collaboration_mode = config_snapshot.collaboration_mode.with_updates(
+            Some(model.clone()),
+            Some(config.model_reasoning_effort.clone()),
+            None,
+        );
+        config_snapshot.session_source = session_source.clone();
+        config_snapshot.forked_from_thread_id = None;
+        config_snapshot.parent_thread_id = Some(parent_thread_id);
+        config_snapshot.thread_source = Some(ThreadSource::Subagent);
+        let runtime_config = session_source
+            .get_agent_role()
+            .and_then(|role_name| config.agent_roles.get(&role_name))
+            .and_then(|role| role.runtime_config.clone())
+            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+
+        let host_thread = self
+            .spawn_external_host_tool_thread(
+                config,
+                session_source.clone(),
+                parent_thread_id,
+                environments,
+            )
+            .await?;
+        let host_tools = Arc::new(ExternalHostTools::new(host_thread));
+        let host_tool_definitions = host_tools.definitions().await?;
+
+        let runtime = match provider
+            .spawn(AgentRuntimeSpawnRequest {
+                thread_id,
+                parent_thread_id: Some(parent_thread_id),
+                role: session_source.get_agent_role(),
+                cwd: config.cwd.clone(),
+                model: Some(model.clone()),
+                model_provider: config.model_provider_id.clone(),
+                runtime_config,
+                host_tools: host_tool_definitions,
+            })
+            .await
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let _ = host_tools.shutdown().await;
+                return Err(CodexErr::Fatal(format!(
+                    "agent runtime `{}` failed to spawn thread: {error}",
+                    provider.id()
+                )));
+            }
+        };
+        if runtime.thread_id() != thread_id {
+            let _ = host_tools.shutdown().await;
+            return Err(CodexErr::Fatal(format!(
+                "agent runtime `{}` returned thread id {}, expected {thread_id}",
+                provider.id(),
+                runtime.thread_id()
+            )));
+        }
+
+        let runtime_persistence = runtime.persistence().await.map_err(|error| {
+            CodexErr::Fatal(format!(
+                "agent runtime `{}` failed to provide persistence state: {error}",
+                provider.id()
+            ))
+        })?;
+        if runtime_persistence.runtime_id != *provider.id() {
+            let _ = runtime.shutdown().await;
+            let _ = host_tools.shutdown().await;
+            return Err(CodexErr::Fatal(format!(
+                "agent runtime `{}` returned persistence state for `{}`",
+                provider.id(),
+                runtime_persistence.runtime_id
+            )));
+        }
+        let runtime_provider = runtime_persistence
+            .metadata
+            .get("provider")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(&config_snapshot.model_provider_id)
+            .to_string();
+        let runtime_model = runtime_persistence
+            .metadata
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(&model)
+            .to_string();
+        config_snapshot.model = runtime_model.clone();
+        config_snapshot.model_provider_id = runtime_provider.clone();
+
+        let persistence = if config.ephemeral {
+            None
+        } else {
+            let live_thread = LiveThread::create(
+                Arc::clone(&self.thread_store),
+                CreateThreadParams {
+                    session_id: parent_thread.session_configured().session_id,
+                    thread_id,
+                    extra_config: config.extra_config.clone(),
+                    forked_from_id: None,
+                    parent_thread_id: Some(parent_thread_id),
+                    source: session_source.clone(),
+                    thread_source: Some(ThreadSource::Subagent),
+                    originator: "codex-external-runtime".to_string(),
+                    base_instructions: BaseInstructions {
+                        text: config.base_instructions.clone().unwrap_or_default(),
+                    },
+                    dynamic_tools: Vec::new(),
+                    selected_capability_roots: Vec::new(),
+                    multi_agent_version: Some(multi_agent_version),
+                    history_mode: config_snapshot.history_mode,
+                    initial_window_id: thread_id.to_string(),
+                    metadata: ThreadPersistenceMetadata {
+                        cwd: Some(config.cwd.to_path_buf()),
+                        model_provider: runtime_provider.clone(),
+                        memory_mode: if config.memories.generate_memories {
+                            ThreadMemoryMode::Enabled
+                        } else {
+                            ThreadMemoryMode::Disabled
+                        },
+                    },
+                },
+            )
+            .await
+            .map_err(|error| {
+                CodexErr::Fatal(format!(
+                    "failed to create external runtime persistence: {error}"
+                ))
+            })?;
+            live_thread
+                .append_items(&[RolloutItem::ExternalRuntimeState(ExternalRuntimeState {
+                    runtime_id: runtime_persistence.runtime_id.to_string(),
+                    session_locator: runtime_persistence.session_locator.clone(),
+                    metadata: runtime_persistence.metadata.clone(),
+                })])
+                .await
+                .map_err(|error| {
+                    CodexErr::Fatal(format!(
+                        "failed to record external runtime persistence: {error}"
+                    ))
+                })?;
+            live_thread.persist().await.map_err(|error| {
+                CodexErr::Fatal(format!(
+                    "failed to materialize external runtime persistence: {error}"
+                ))
+            })?;
+            Some(live_thread)
+        };
+        let rollout_path = match persistence.as_ref() {
+            Some(persistence) => persistence.local_rollout_path().await.map_err(|error| {
+                CodexErr::Fatal(format!("failed to resolve external rollout path: {error}"))
+            })?,
+            None => None,
+        };
+
+        let session_configured = SessionConfiguredEvent {
+            session_id: thread_id.into(),
+            thread_id,
+            forked_from_id: None,
+            parent_thread_id: Some(parent_thread_id),
+            thread_source: Some(ThreadSource::Subagent),
+            thread_name: None,
+            model: runtime_model,
+            model_provider_id: runtime_provider,
+            service_tier: config_snapshot.service_tier.clone(),
+            approval_policy: config_snapshot.approval_policy,
+            approvals_reviewer: config_snapshot.approvals_reviewer,
+            permission_profile: config_snapshot.permission_profile.clone(),
+            active_permission_profile: config_snapshot.active_permission_profile.clone(),
+            cwd: config.cwd.clone(),
+            reasoning_effort: config_snapshot.reasoning_effort.clone(),
+            initial_messages: None,
+            network_proxy: None,
+            rollout_path,
+        };
+        let managed_thread = Arc::new(
+            ManagedAgentThread::external(
+                runtime,
+                session_source,
+                config_snapshot,
+                session_configured,
+                Some(multi_agent_version),
+                Some(Arc::clone(&host_tools)),
+                persistence,
+            )
+            .await?,
+        );
+        let mut threads = self.threads.write().await;
+        match threads.entry(thread_id) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(managed_thread);
+                Ok(thread_id)
+            }
+            std::collections::hash_map::Entry::Occupied(_) => Err(CodexErr::InvalidRequest(
+                format!("thread {thread_id} is already running"),
+            )),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn resume_external_agent_thread(
+        self: &Arc<Self>,
+        provider: Arc<dyn AgentRuntimeProvider>,
+        config: &Config,
+        session_source: SessionSource,
+        parent_thread_id: Option<ThreadId>,
+        multi_agent_version: MultiAgentVersion,
+        initial_history: InitialHistory,
+        external_state: ExternalRuntimeState,
+    ) -> CodexResult<Arc<ManagedAgentThread>> {
+        let InitialHistory::Resumed(resumed) = initial_history else {
+            return Err(CodexErr::InvalidRequest(
+                "external runtime resume requires resumed history".to_string(),
+            ));
+        };
+        let thread_id = resumed.conversation_id;
+        let parent_thread_id = parent_thread_id
+            .or_else(|| session_source.parent_thread_id())
+            .ok_or_else(|| {
+                CodexErr::InvalidRequest(
+                    "external runtime resume requires a parent thread id".to_string(),
+                )
+            })?;
+        let parent_thread = self.get_thread(parent_thread_id).await?;
+        let mut config_snapshot = parent_thread.config_snapshot().await;
+        config_snapshot.session_source = session_source.clone();
+        config_snapshot.parent_thread_id = Some(parent_thread_id);
+        config_snapshot.thread_source = Some(ThreadSource::Subagent);
+
+        let host_thread = self
+            .spawn_external_host_tool_thread(
+                config,
+                session_source.clone(),
+                parent_thread_id,
+                /*environments*/ None,
+            )
+            .await?;
+        let host_tools = Arc::new(ExternalHostTools::new(host_thread));
+        let runtime = provider
+            .resume(AgentRuntimeResumeRequest {
+                thread_id,
+                parent_thread_id: Some(parent_thread_id),
+                cwd: config.cwd.clone(),
+                state: AgentRuntimePersistence {
+                    runtime_id: AgentRuntimeId::new(external_state.runtime_id.clone())
+                        .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?,
+                    session_locator: external_state.session_locator,
+                    metadata: external_state.metadata,
+                },
+                host_tools: host_tools.definitions().await?,
+            })
+            .await
+            .map_err(|error| {
+                CodexErr::Fatal(format!(
+                    "agent runtime `{}` failed to resume thread {thread_id}: {error}",
+                    provider.id()
+                ))
+            })?;
+        if runtime.thread_id() != thread_id {
+            let _ = runtime.shutdown().await;
+            let _ = host_tools.shutdown().await;
+            return Err(CodexErr::Fatal(format!(
+                "agent runtime `{}` resumed thread {}, expected {thread_id}",
+                provider.id(),
+                runtime.thread_id()
+            )));
+        }
+        let runtime_persistence = runtime.persistence().await.map_err(|error| {
+            CodexErr::Fatal(format!(
+                "agent runtime `{}` failed to refresh persistence state: {error}",
+                provider.id()
+            ))
+        })?;
+        let runtime_provider = runtime_persistence
+            .metadata
+            .get("provider")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(&config_snapshot.model_provider_id)
+            .to_string();
+        let runtime_model = runtime_persistence
+            .metadata
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(&config_snapshot.model)
+            .to_string();
+        config_snapshot.model = runtime_model.clone();
+        config_snapshot.model_provider_id = runtime_provider.clone();
+
+        let persistence = LiveThread::resume(
+            Arc::clone(&self.thread_store),
+            config_snapshot.history_mode,
+            ResumeThreadParams {
+                thread_id,
+                rollout_path: resumed.rollout_path.clone(),
+                history: Some(resumed.history.clone()),
+                include_archived: true,
+                metadata: ThreadPersistenceMetadata {
+                    cwd: Some(config.cwd.to_path_buf()),
+                    model_provider: runtime_provider.clone(),
+                    memory_mode: if config.memories.generate_memories {
+                        ThreadMemoryMode::Enabled
+                    } else {
+                        ThreadMemoryMode::Disabled
+                    },
+                },
+            },
+        )
+        .await
+        .map_err(|error| {
+            CodexErr::Fatal(format!(
+                "failed to reopen external runtime persistence: {error}"
+            ))
+        })?;
+        persistence
+            .append_items(&[RolloutItem::ExternalRuntimeState(ExternalRuntimeState {
+                runtime_id: runtime_persistence.runtime_id.to_string(),
+                session_locator: runtime_persistence.session_locator,
+                metadata: runtime_persistence.metadata,
+            })])
+            .await
+            .map_err(|error| {
+                CodexErr::Fatal(format!(
+                    "failed to refresh external runtime persistence: {error}"
+                ))
+            })?;
+        persistence.persist().await.map_err(|error| {
+            CodexErr::Fatal(format!(
+                "failed to persist resumed external runtime: {error}"
+            ))
+        })?;
+        let rollout_path = persistence.local_rollout_path().await.map_err(|error| {
+            CodexErr::Fatal(format!("failed to resolve external rollout path: {error}"))
+        })?;
+        let session_configured = SessionConfiguredEvent {
+            session_id: parent_thread.session_configured().session_id,
+            thread_id,
+            forked_from_id: None,
+            parent_thread_id: Some(parent_thread_id),
+            thread_source: Some(ThreadSource::Subagent),
+            thread_name: None,
+            model: runtime_model,
+            model_provider_id: runtime_provider,
+            service_tier: config_snapshot.service_tier.clone(),
+            approval_policy: config_snapshot.approval_policy,
+            approvals_reviewer: config_snapshot.approvals_reviewer,
+            permission_profile: config_snapshot.permission_profile.clone(),
+            active_permission_profile: config_snapshot.active_permission_profile.clone(),
+            cwd: config.cwd.clone(),
+            reasoning_effort: config_snapshot.reasoning_effort.clone(),
+            initial_messages: None,
+            network_proxy: None,
+            rollout_path,
+        };
+        let managed_thread = Arc::new(
+            ManagedAgentThread::external(
+                runtime,
+                session_source,
+                config_snapshot,
+                session_configured,
+                Some(multi_agent_version),
+                Some(host_tools),
+                Some(persistence),
+            )
+            .await?,
+        );
+        let mut threads = self.threads.write().await;
+        match threads.entry(thread_id) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Arc::clone(&managed_thread));
+                Ok(managed_thread)
+            }
+            std::collections::hash_map::Entry::Occupied(_) => Err(CodexErr::InvalidRequest(
+                format!("thread {thread_id} is already running"),
+            )),
+        }
+    }
+
+    async fn spawn_external_host_tool_thread(
+        self: &Arc<Self>,
+        config: &Config,
+        session_source: SessionSource,
+        parent_thread_id: ThreadId,
+        environments: Option<Vec<TurnEnvironmentSelection>>,
+    ) -> CodexResult<Arc<CodexThread>> {
+        let mut host_config = config.clone();
+        host_config.ephemeral = true;
+        let environments = environments.unwrap_or_else(|| {
+            default_thread_environment_selections(
+                self.environment_manager.as_ref(),
+                &host_config.cwd,
+            )
+        });
+        let new_thread = self
+            .spawn_thread_with_source(
+                host_config.clone(),
+                InitialHistory::New,
+                None,
+                false,
+                Arc::clone(&self.auth_manager),
+                AgentControl::new(Arc::downgrade(self), host_config.rollout_budget.clone()),
+                session_source,
+                Some(parent_thread_id),
+                None,
+                Some(ThreadSource::Subagent),
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+                environments,
+                ExtensionDataInit::default(),
+                false,
+                None,
+            )
+            .await?;
+        self.threads.write().await.remove(&new_thread.thread_id);
+        Ok(new_thread.thread)
+    }
+
     pub(crate) fn agent_graph_store(&self) -> Option<Arc<dyn AgentGraphStore>> {
         self.agent_graph_store.clone()
     }
@@ -1098,7 +1611,7 @@ impl ThreadManagerState {
             .await
             .iter()
             .filter_map(|(thread_id, thread)| {
-                (!thread.session_source.is_internal()).then_some(*thread_id)
+                (!thread.session_source().is_internal()).then_some(*thread_id)
             })
             .collect()
     }
@@ -1110,10 +1623,10 @@ impl ThreadManagerState {
             .await
             .iter()
             .filter_map(|(thread_id, thread)| {
-                if thread.session_source.is_internal() {
+                if thread.session_source().is_internal() {
                     return None;
                 }
-                match &thread.session_source {
+                match thread.session_source() {
                     SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                         parent_thread_id,
                         ..
@@ -1125,12 +1638,30 @@ impl ThreadManagerState {
     }
 
     /// Fetch a thread by ID or return ThreadNotFound.
-    pub(crate) async fn get_thread(&self, thread_id: ThreadId) -> CodexResult<Arc<CodexThread>> {
+    pub(crate) async fn get_thread(
+        &self,
+        thread_id: ThreadId,
+    ) -> CodexResult<Arc<ManagedAgentThread>> {
         let threads = self.threads.read().await;
         match threads.get(&thread_id) {
-            Some(thread) if !thread.session_source.is_internal() => Ok(thread.clone()),
+            Some(thread) if !thread.session_source().is_internal() => Ok(thread.clone()),
             Some(_) | None => Err(CodexErr::ThreadNotFound(thread_id)),
         }
+    }
+
+    pub(crate) async fn get_native_thread(
+        &self,
+        thread_id: ThreadId,
+    ) -> CodexResult<Arc<CodexThread>> {
+        self.get_thread(thread_id)
+            .await?
+            .as_codex_thread()
+            .cloned()
+            .ok_or_else(|| {
+                CodexErr::UnsupportedOperation(format!(
+                    "thread {thread_id} is owned by an external agent runtime"
+                ))
+            })
     }
 
     pub(crate) async fn read_stored_thread(
@@ -1170,7 +1701,10 @@ impl ThreadManagerState {
     }
 
     /// Remove a thread from the manager by ID, returning it when present.
-    pub(crate) async fn remove_thread(&self, thread_id: &ThreadId) -> Option<Arc<CodexThread>> {
+    pub(crate) async fn remove_thread(
+        &self,
+        thread_id: &ThreadId,
+    ) -> Option<Arc<ManagedAgentThread>> {
         self.threads.write().await.remove(thread_id)
     }
 
@@ -1259,7 +1793,10 @@ impl ThreadManagerState {
             // The spawn path retains only thread IDs, so look up the live
             // runtime again here to inherit its user instructions.
             Some(thread_id) => match self.get_thread(thread_id).await {
-                Ok(thread) => thread.codex.session.user_instructions().await,
+                Ok(thread) => match thread.as_codex_thread() {
+                    Some(thread) => thread.codex.session.user_instructions().await,
+                    None => None,
+                },
                 Err(_) => None,
             },
             None => None,
@@ -1391,9 +1928,9 @@ impl ThreadManagerState {
     }
 
     pub(crate) async fn resume_thread_with_history_with_source(
-        &self,
+        self: &Arc<Self>,
         options: ResumeThreadWithHistoryOptions,
-    ) -> CodexResult<NewThread> {
+    ) -> CodexResult<ResumedManagedThread> {
         let ResumeThreadWithHistoryOptions {
             config,
             initial_history,
@@ -1406,7 +1943,41 @@ impl ThreadManagerState {
         let environments =
             default_thread_environment_selections(self.environment_manager.as_ref(), &config.cwd);
         let thread_source = initial_history.get_resumed_thread_source();
-        Box::pin(self.spawn_thread_with_source(
+        if let Some(external_state) = initial_history_external_runtime_state(&initial_history) {
+            let runtime_id = AgentRuntimeId::new(external_state.runtime_id.clone())
+                .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
+            let provider = match self.resolve_agent_runtime(&runtime_id).map_err(|error| {
+                CodexErr::InvalidRequest(format!(
+                    "cannot resume external runtime `{runtime_id}`: {error}"
+                ))
+            })? {
+                ResolvedAgentRuntime::External(provider) => provider,
+                ResolvedAgentRuntime::Codex => {
+                    return Err(CodexErr::InvalidRequest(
+                        "persisted external runtime cannot be `codex`".to_string(),
+                    ));
+                }
+            };
+            let multi_agent_version = initial_history
+                .get_multi_agent_version()
+                .unwrap_or(MultiAgentVersion::V2);
+            let thread = self
+                .resume_external_agent_thread(
+                    provider,
+                    &config,
+                    session_source,
+                    parent_thread_id,
+                    multi_agent_version,
+                    initial_history,
+                    external_state,
+                )
+                .await?;
+            return Ok(ResumedManagedThread {
+                thread_id: thread.thread_id(),
+                thread,
+            });
+        }
+        let resumed = Box::pin(self.spawn_thread_with_source(
             config,
             initial_history,
             /*history_mode*/ None,
@@ -1427,7 +1998,11 @@ impl ThreadManagerState {
             /*supports_openai_form_elicitation*/ false,
             /*user_shell_override*/ None,
         ))
-        .await
+        .await?;
+        Ok(ResumedManagedThread {
+            thread_id: resumed.thread_id,
+            thread: Arc::new(ManagedAgentThread::codex(resumed.thread)),
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1541,7 +2116,13 @@ impl ThreadManagerState {
         let is_resumed_thread = matches!(&initial_history, InitialHistory::Resumed(_));
         if let InitialHistory::Resumed(resumed) = &initial_history {
             let mut threads = self.threads.write().await;
-            if let Some(thread) = threads.get(&resumed.conversation_id).cloned() {
+            if let Some(managed_thread) = threads.get(&resumed.conversation_id).cloned() {
+                let Some(thread) = managed_thread.as_codex_thread().cloned() else {
+                    return Err(CodexErr::UnsupportedOperation(format!(
+                        "external thread {} must be resumed by its runtime provider",
+                        resumed.conversation_id
+                    )));
+                };
                 if thread.is_running() {
                     if let Some(requested_rollout_path) = resumed.rollout_path.as_deref()
                         && thread.rollout_path().as_deref() != Some(requested_rollout_path)
@@ -1659,7 +2240,7 @@ impl ThreadManagerState {
                     session_configured.rollout_path.clone(),
                     session_source,
                 ));
-                e.insert(thread.clone());
+                e.insert(Arc::new(ManagedAgentThread::codex(thread.clone())));
                 return Ok(NewThread {
                     thread_id,
                     thread,
@@ -1706,7 +2287,11 @@ impl ThreadManagerState {
         self.get_thread(*parent_thread_id)
             .await
             .ok()
-            .map(|thread| thread.codex.session.services.rollout_thread_trace.clone())
+            .and_then(|thread| {
+                thread
+                    .as_codex_thread()
+                    .map(|thread| thread.codex.session.services.rollout_thread_trace.clone())
+            })
             .unwrap_or_else(codex_rollout_trace::ThreadTraceContext::disabled)
     }
 }
@@ -1726,6 +2311,20 @@ fn stored_thread_to_initial_history(
         history: Arc::new(history.items),
         rollout_path: rollout_path.or(stored_thread.rollout_path),
     }))
+}
+
+fn initial_history_external_runtime_state(
+    initial_history: &InitialHistory,
+) -> Option<ExternalRuntimeState> {
+    let items = match initial_history {
+        InitialHistory::Resumed(resumed) => resumed.history.as_ref(),
+        InitialHistory::Forked(items) => items.as_slice(),
+        InitialHistory::New | InitialHistory::Cleared => return None,
+    };
+    items.iter().rev().find_map(|item| match item {
+        RolloutItem::ExternalRuntimeState(state) => Some(state.clone()),
+        _ => None,
+    })
 }
 
 fn thread_store_rollout_read_error(err: ThreadStoreError) -> CodexErr {

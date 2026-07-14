@@ -356,7 +356,7 @@ impl ToolRegistry {
         Self::new(HashMap::from([(name, handler as Arc<dyn CoreToolRuntime>)]))
     }
 
-    fn tool(&self, name: &ToolName) -> Option<Arc<dyn CoreToolRuntime>> {
+    pub(crate) fn tool(&self, name: &ToolName) -> Option<Arc<dyn CoreToolRuntime>> {
         self.tools.get(name).map(Arc::clone)
     }
 

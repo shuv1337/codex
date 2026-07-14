@@ -4,22 +4,42 @@ use crate::agent::control::SpawnAgentOptions;
 use crate::agent::next_thread_spawn_depth;
 use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent::role::apply_role_to_config;
+use crate::agent::role::resolve_role_runtime_id;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
+use crate::tools::handlers::multi_agents_spec::create_external_runtime_spawn_agent_tool_v2;
 use crate::tools::handlers::multi_agents_spec::create_spawn_agent_tool_v2;
 use crate::tools::handlers::multi_agents_v2::message_tool::message_content;
 use codex_protocol::AgentPath;
 use codex_tools::ToolSpec;
 
+#[derive(Clone, Copy, Default)]
+enum SpawnToolKind {
+    #[default]
+    Reserved,
+    ExternalRuntime,
+}
+
 #[derive(Default)]
 pub(crate) struct Handler {
     options: SpawnAgentToolOptions,
+    kind: SpawnToolKind,
 }
 
 impl Handler {
     pub(crate) fn new(options: SpawnAgentToolOptions) -> Self {
-        Self { options }
+        Self {
+            options,
+            kind: SpawnToolKind::Reserved,
+        }
+    }
+
+    pub(crate) fn new_external_runtime(options: SpawnAgentToolOptions) -> Self {
+        Self {
+            options,
+            kind: SpawnToolKind::ExternalRuntime,
+        }
     }
 }
 
@@ -29,16 +49,29 @@ impl ToolExecutor<ToolInvocation> for Handler {
     }
 
     fn spec(&self) -> ToolSpec {
-        create_spawn_agent_tool_v2(self.options.clone())
+        match self.kind {
+            SpawnToolKind::Reserved => create_spawn_agent_tool_v2(self.options.clone()),
+            SpawnToolKind::ExternalRuntime => {
+                create_external_runtime_spawn_agent_tool_v2(self.options.clone())
+            }
+        }
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
-        Box::pin(async move { handle_spawn_agent(invocation).await.map(boxed_tool_output) })
+        let kind = self.kind;
+        let hide_agent_metadata = self.options.hide_agent_type_model_reasoning;
+        Box::pin(async move {
+            handle_spawn_agent(invocation, kind, hide_agent_metadata)
+                .await
+                .map(boxed_tool_output)
+        })
     }
 }
 
 async fn handle_spawn_agent(
     invocation: ToolInvocation,
+    kind: SpawnToolKind,
+    hide_agent_metadata: bool,
 ) -> Result<SpawnAgentResult, FunctionCallError> {
     let ToolInvocation {
         session,
@@ -49,18 +82,32 @@ async fn handle_spawn_agent(
     } = invocation;
     let arguments = function_arguments(payload)?;
     let args: SpawnAgentArgs = parse_arguments(&arguments)?;
-    let fork_mode = args.fork_mode()?;
     let role_name = args
         .agent_type
         .as_deref()
         .map(str::trim)
         .filter(|role| !role.is_empty());
+    let fork_mode = args.fork_mode(kind)?;
 
     let message = message_content(args.message)?;
     let session_source = turn.session_source.clone();
     let child_depth = next_thread_spawn_depth(&session_source);
     let mut config =
         build_agent_spawn_config(&session.get_base_instructions().await, turn.as_ref())?;
+    if matches!(kind, SpawnToolKind::ExternalRuntime) {
+        let role_name = role_name.ok_or_else(|| {
+            FunctionCallError::RespondToModel(
+                "runtime_agents.spawn_agent requires `agent_type`".to_string(),
+            )
+        })?;
+        let runtime_id = resolve_role_runtime_id(&config, Some(role_name))
+            .map_err(FunctionCallError::RespondToModel)?;
+        if runtime_id.is_codex() {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "runtime_agents.spawn_agent requires an external runtime role; agent_type `{role_name}` resolves to native Codex"
+            )));
+        }
+    }
     if let Some(service_tier) = args.service_tier.as_ref() {
         config.service_tier = Some(service_tier.clone());
     }
@@ -108,7 +155,18 @@ async fn handle_spawn_agent(
         .session_source
         .get_agent_path()
         .unwrap_or_else(AgentPath::root);
-    let communication = communication_from_tool_message(author, new_agent_path.clone(), message);
+    let communication = match kind {
+        SpawnToolKind::Reserved => {
+            communication_from_tool_message(author, new_agent_path.clone(), message)
+        }
+        SpawnToolKind::ExternalRuntime => InterAgentCommunication::new(
+            author,
+            new_agent_path.clone(),
+            Vec::new(),
+            message,
+            /*trigger_turn*/ true,
+        ),
+    };
     let context = AgentCommunicationContext::new(AgentCommunicationKind::Spawn, session.thread_id);
     let spawned_agent = Box::pin(
         session
@@ -158,7 +216,6 @@ async fn handle_spawn_agent(
     );
     let task_name = String::from(new_agent_path);
 
-    let hide_agent_metadata = turn.config.multi_agent_v2.hide_spawn_agent_metadata;
     if hide_agent_metadata {
         Ok(SpawnAgentResult::HiddenMetadata { task_name })
     } else {
@@ -189,10 +246,28 @@ struct SpawnAgentArgs {
 }
 
 impl SpawnAgentArgs {
-    fn fork_mode(&self) -> Result<Option<SpawnAgentForkMode>, FunctionCallError> {
+    fn fork_mode(
+        &self,
+        kind: SpawnToolKind,
+    ) -> Result<Option<SpawnAgentForkMode>, FunctionCallError> {
         if self.fork_context.is_some() {
             return Err(FunctionCallError::RespondToModel(
                 "fork_context is not supported in MultiAgentV2; use fork_turns instead".to_string(),
+            ));
+        }
+
+        if matches!(kind, SpawnToolKind::ExternalRuntime) {
+            let requested = self
+                .fork_turns
+                .as_deref()
+                .map(str::trim)
+                .filter(|fork_turns| !fork_turns.is_empty());
+            if requested.is_none_or(|fork_turns| fork_turns.eq_ignore_ascii_case("none")) {
+                return Ok(None);
+            }
+            return Err(FunctionCallError::RespondToModel(
+                "runtime_agents.spawn_agent cannot fork Codex history; omit `fork_turns` or pass `none`"
+                    .to_string(),
             ));
         }
 
@@ -252,5 +327,63 @@ impl ToolOutput for SpawnAgentResult {
 
     fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
         tool_output_code_mode_result(self, "spawn_agent")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args_with_fork_turns(fork_turns: Option<&str>) -> SpawnAgentArgs {
+        SpawnAgentArgs {
+            message: "task".to_string(),
+            task_name: "task".to_string(),
+            agent_type: Some("pi_worker".to_string()),
+            model: None,
+            reasoning_effort: None,
+            service_tier: None,
+            fork_turns: fork_turns.map(str::to_string),
+            fork_context: None,
+        }
+    }
+
+    #[test]
+    fn external_runtime_spawn_defaults_to_no_fork() {
+        assert!(
+            args_with_fork_turns(None)
+                .fork_mode(SpawnToolKind::ExternalRuntime)
+                .expect("omitted fork_turns should be accepted")
+                .is_none()
+        );
+        assert!(
+            args_with_fork_turns(Some("none"))
+                .fork_mode(SpawnToolKind::ExternalRuntime)
+                .expect("fork_turns=none should be accepted")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn external_runtime_spawn_rejects_history_fork() {
+        let error = args_with_fork_turns(Some("all"))
+            .fork_mode(SpawnToolKind::ExternalRuntime)
+            .expect_err("external runtime history forks must be rejected");
+        assert_eq!(
+            error,
+            FunctionCallError::RespondToModel(
+                "runtime_agents.spawn_agent cannot fork Codex history; omit `fork_turns` or pass `none`"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn reserved_spawn_keeps_full_history_default() {
+        assert!(matches!(
+            args_with_fork_turns(None)
+                .fork_mode(SpawnToolKind::Reserved)
+                .expect("reserved default should remain valid"),
+            Some(SpawnAgentForkMode::FullHistory)
+        ));
     }
 }

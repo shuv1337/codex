@@ -2829,6 +2829,8 @@ async fn start_new_context_window_assigns_and_persists_item_ids() {
     let persisted_replacement_history = resumed.history.iter().rev().find_map(|item| match item {
         RolloutItem::Compacted(compacted) => compacted.replacement_history.as_ref(),
         RolloutItem::SessionMeta(_)
+        | RolloutItem::ExternalRuntimeItem(_)
+        | RolloutItem::ExternalRuntimeState(_)
         | RolloutItem::ResponseItem(_)
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
@@ -2888,6 +2890,8 @@ async fn record_initial_history_assigns_and_persists_id_for_forked_response_item
     let persisted_item_id = resumed.history.iter().find_map(|item| match item {
         RolloutItem::ResponseItem(response_item) => response_item.id(),
         RolloutItem::SessionMeta(_)
+        | RolloutItem::ExternalRuntimeItem(_)
+        | RolloutItem::ExternalRuntimeState(_)
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
         | RolloutItem::Compacted(_)
@@ -4953,6 +4957,8 @@ enabled = false
             description: None,
             config_file: Some(role_path.to_path_buf()),
             nickname_candidates: None,
+            runtime: None,
+            runtime_config: None,
         },
     );
     crate::agent::role::apply_role_to_config(&mut child_config, Some("custom"))

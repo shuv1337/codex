@@ -95,6 +95,7 @@ use tracing::instrument;
 use tracing::warn;
 
 const MULTI_AGENT_V2_NAMESPACE_DESCRIPTION: &str = "Tools for spawning and managing sub-agents.";
+const EXTERNAL_AGENT_RUNTIME_NAMESPACE: &str = "runtime_agents";
 const IMAGE_GEN_NAMESPACE: &str = "image_gen";
 const IMAGEGEN_TOOL_NAME: &str = "imagegen";
 
@@ -797,13 +798,17 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
             let tool_namespace = namespace_tools_enabled(turn_context)
                 .then_some(turn_context.config.multi_agent_v2.tool_namespace.as_deref())
                 .flatten();
-            let agent_type_description =
-                agent_type_description(turn_context, context.default_agent_type_description);
+            let reserved_agent_type_description = agent_type_description_for_runtime_kind(
+                turn_context,
+                context.default_agent_type_description,
+                /*external*/ false,
+            );
+            let has_external_runtime_roles = has_external_agent_runtime_roles(turn_context);
             planned_tools.add_arc(override_tool_exposure(
                 multi_agent_v2_handler(
                     SpawnAgentHandlerV2::new(SpawnAgentToolOptions {
                         available_models: turn_context.available_models.clone(),
-                        agent_type_description,
+                        agent_type_description: reserved_agent_type_description,
                         hide_agent_type_model_reasoning: turn_context
                             .config
                             .multi_agent_v2
@@ -814,6 +819,30 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
                 ),
                 exposure,
             ));
+            if has_external_runtime_roles
+                && tool_namespace != Some(EXTERNAL_AGENT_RUNTIME_NAMESPACE)
+            {
+                planned_tools.add_arc(override_tool_exposure(
+                    multi_agent_v2_handler(
+                        SpawnAgentHandlerV2::new_external_runtime(SpawnAgentToolOptions {
+                            available_models: turn_context.available_models.clone(),
+                            agent_type_description: agent_type_description_for_runtime_kind(
+                                turn_context,
+                                context.default_agent_type_description,
+                                /*external*/ true,
+                            ),
+                            hide_agent_type_model_reasoning: false,
+                            usage_hint_text: turn_context
+                                .config
+                                .multi_agent_v2
+                                .usage_hint_text
+                                .clone(),
+                        }),
+                        Some(EXTERNAL_AGENT_RUNTIME_NAMESPACE),
+                    ),
+                    exposure,
+                ));
+            }
             planned_tools.add_arc(override_tool_exposure(
                 multi_agent_v2_handler(SendMessageHandlerV2, tool_namespace),
                 exposure,
@@ -867,6 +896,39 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
         if agent_jobs_worker_tools_enabled(turn_context) {
             planned_tools.add(ReportAgentJobResultHandler);
         }
+    }
+}
+
+fn has_external_agent_runtime_roles(turn_context: &TurnContext) -> bool {
+    turn_context.config.agent_roles.values().any(|role| {
+        role.runtime
+            .as_deref()
+            .is_some_and(|runtime| runtime != "codex")
+    })
+}
+
+fn agent_type_description_for_runtime_kind(
+    turn_context: &TurnContext,
+    default_agent_type_description: &str,
+    external: bool,
+) -> String {
+    let roles = turn_context
+        .config
+        .agent_roles
+        .iter()
+        .filter(|(_, role)| {
+            role.runtime
+                .as_deref()
+                .is_some_and(|runtime| runtime != "codex")
+                == external
+        })
+        .map(|(name, role)| (name.clone(), role.clone()))
+        .collect();
+    let description = crate::agent::role::spawn_tool_spec::build(&roles);
+    if description.is_empty() {
+        default_agent_type_description.to_string()
+    } else {
+        description
     }
 }
 

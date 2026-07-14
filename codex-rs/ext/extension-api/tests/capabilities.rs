@@ -1,6 +1,8 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use codex_extension_api::AgentRuntimeErrorKind;
+use codex_extension_api::AgentRuntimeId;
 use codex_extension_api::AgentSpawnFuture;
 use codex_extension_api::AgentSpawner;
 use codex_extension_api::NoopResponseItemInjector;
@@ -53,4 +55,20 @@ async fn closure_agent_spawner_forwards_arguments_and_result() {
         calls.lock().expect("agent spawn calls lock").as_slice(),
         [(thread_id, "delegate this".to_string())]
     );
+}
+
+#[test]
+fn agent_runtime_id_normalizes_outer_whitespace() {
+    assert_eq!(
+        AgentRuntimeId::new("  pi  ").expect("valid runtime id"),
+        AgentRuntimeId::new("pi").expect("valid runtime id")
+    );
+}
+
+#[test]
+fn agent_runtime_id_rejects_invalid_values() {
+    for value in ["", " ", "Pi", "pi runtime", "pi/runtime"] {
+        let error = AgentRuntimeId::new(value).expect_err("invalid runtime id");
+        assert_eq!(error.kind, AgentRuntimeErrorKind::InvalidRuntimeId);
+    }
 }

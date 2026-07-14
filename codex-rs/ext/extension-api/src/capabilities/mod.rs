@@ -1,9 +1,23 @@
 mod agent;
+mod agent_runtime;
 mod events;
 mod response_items;
 
 pub use agent::AgentSpawnFuture;
 pub use agent::AgentSpawner;
+pub use agent_runtime::AgentRuntimeError;
+pub use agent_runtime::AgentRuntimeErrorKind;
+pub use agent_runtime::AgentRuntimeFuture;
+pub use agent_runtime::AgentRuntimeHostToolDefinition;
+pub use agent_runtime::AgentRuntimeId;
+pub use agent_runtime::AgentRuntimeOperation;
+pub use agent_runtime::AgentRuntimePersistence;
+pub use agent_runtime::AgentRuntimeProvider;
+pub use agent_runtime::AgentRuntimeResumeRequest;
+pub use agent_runtime::AgentRuntimeSpawnRequest;
+pub use agent_runtime::AgentRuntimeThread;
+pub use agent_runtime::AgentRuntimeToolCall;
+pub use agent_runtime::AgentRuntimeToolResult;
 pub use events::ExtensionEventSink;
 pub use events::NoopExtensionEventSink;
 pub use response_items::NoopResponseItemInjector;

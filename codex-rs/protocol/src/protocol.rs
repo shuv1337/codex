@@ -2647,6 +2647,8 @@ impl InitialHistory {
             .find_map(|item| match item {
                 RolloutItem::TurnContext(turn_context) => Some(turn_context),
                 RolloutItem::SessionMeta(_)
+                | RolloutItem::ExternalRuntimeItem(_)
+                | RolloutItem::ExternalRuntimeState(_)
                 | RolloutItem::ResponseItem(_)
                 | RolloutItem::InterAgentCommunication(_)
                 | RolloutItem::InterAgentCommunicationMetadata { .. }
@@ -2983,6 +2985,8 @@ fn multi_agent_version_from_items(
         items.iter().rev().find_map(|item| match item {
             RolloutItem::TurnContext(turn_context) => turn_context.multi_agent_version,
             RolloutItem::SessionMeta(_)
+            | RolloutItem::ExternalRuntimeItem(_)
+            | RolloutItem::ExternalRuntimeState(_)
             | RolloutItem::ResponseItem(_)
             | RolloutItem::InterAgentCommunication(_)
             | RolloutItem::InterAgentCommunicationMetadata { .. }
@@ -3140,6 +3144,10 @@ impl<'de> Deserialize<'de> for SessionMetaLine {
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum RolloutItem {
     SessionMeta(SessionMetaLine),
+    /// Opaque provider-owned state required to resume a non-Codex agent runtime.
+    ExternalRuntimeState(ExternalRuntimeState),
+    /// Canonical completed item emitted by a non-Codex agent runtime.
+    ExternalRuntimeItem(ExternalRuntimeItem),
     ResponseItem(ResponseItem),
     /// Legacy delivery item reconstructed as a model-visible `agent_message`.
     InterAgentCommunication(InterAgentCommunication),
@@ -3151,6 +3159,22 @@ pub enum RolloutItem {
     TurnContext(TurnContextItem),
     WorldState(WorldStateItem),
     EventMsg(EventMsg),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalRuntimeState {
+    pub runtime_id: String,
+    pub session_locator: String,
+    #[serde(default)]
+    pub metadata: Value,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalRuntimeItem {
+    pub turn_id: String,
+    pub item: crate::items::TurnItem,
 }
 
 /// Persisted comparison state used to resume model-visible world-state diffing.

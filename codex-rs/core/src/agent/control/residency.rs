@@ -1,7 +1,7 @@
 use super::AgentControl;
 use crate::agent::AgentStatus;
-use crate::codex_thread::CodexThread;
 use crate::config::Config;
+use crate::managed_agent_thread::ManagedAgentThread;
 use crate::thread_manager::ThreadManagerState;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
@@ -213,26 +213,36 @@ fn touch_resident(residents: &mut VecDeque<ThreadId>, thread_id: ThreadId) {
     residents.push_back(thread_id);
 }
 
-fn is_resident_candidate(thread: &CodexThread) -> bool {
+fn is_resident_candidate(thread: &ManagedAgentThread) -> bool {
     thread.multi_agent_version() == Some(MultiAgentVersion::V2)
-        && is_v2_resident_session_source(&thread.session_source)
+        && is_v2_resident_session_source(thread.session_source())
 }
 
 pub(super) fn is_v2_resident_session_source(session_source: &SessionSource) -> bool {
     matches!(session_source, SessionSource::SubAgent(_))
 }
 
-async fn is_unloadable(thread: &CodexThread) -> bool {
+async fn is_unloadable(thread: &ManagedAgentThread) -> bool {
     matches!(
         thread.agent_status().await,
         AgentStatus::Completed(_) | AgentStatus::Errored(_) | AgentStatus::Interrupted
-    ) && thread.codex.session.active_turn.lock().await.is_none()
-        && !thread
+    ) && if let Some(codex_thread) = thread.as_codex_thread() {
+        codex_thread
             .codex
             .session
-            .input_queue
-            .has_pending_mailbox_items()
+            .active_turn
+            .lock()
             .await
+            .is_none()
+            && !codex_thread
+                .codex
+                .session
+                .input_queue
+                .has_pending_mailbox_items()
+                .await
+    } else {
+        true
+    }
 }
 
 #[cfg(test)]

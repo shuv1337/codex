@@ -1,8 +1,10 @@
 use crate::agent::AgentStatus;
+use crate::agent::ResolvedAgentRuntime;
 use crate::agent::registry::AgentMetadata;
 use crate::agent::registry::AgentRegistry;
 use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent::role::resolve_role_config;
+use crate::agent::role::resolve_role_runtime_id;
 use crate::agent::status::is_final;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
@@ -599,6 +601,7 @@ impl AgentControl {
         };
 
         let parent_thread = state.get_thread(*parent_thread_id).await.ok()?;
+        let parent_thread = parent_thread.as_codex_thread()?;
         Some(
             parent_thread
                 .codex
@@ -624,6 +627,7 @@ impl AgentControl {
         };
 
         let parent_thread = state.get_thread(*parent_thread_id).await.ok()?;
+        let parent_thread = parent_thread.as_codex_thread()?;
         let parent_config = parent_thread.codex.session.get_config().await;
         if !crate::exec_policy::child_uses_parent_exec_policy(&parent_config, child_config) {
             return None;

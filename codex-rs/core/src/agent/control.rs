@@ -325,9 +325,18 @@ impl AgentControl {
         Some(thread.config_snapshot().await)
     }
 
+    pub(crate) async fn agent_uses_external_runtime(
+        &self,
+        agent_id: ThreadId,
+    ) -> CodexResult<bool> {
+        let state = self.upgrade()?;
+        let thread = state.get_thread(agent_id).await?;
+        Ok(thread.as_codex_thread().is_none())
+    }
+
     pub(crate) async fn resolve_agent_reference(
         &self,
-        _current_thread_id: ThreadId,
+        current_thread_id: ThreadId,
         current_session_source: &SessionSource,
         agent_reference: &str,
     ) -> CodexResult<ThreadId> {
@@ -339,6 +348,53 @@ impl AgentControl {
             .map_err(CodexErr::UnsupportedOperation)?;
         if let Some(thread_id) = self.state.agent_id_for_path(&agent_path) {
             return Ok(thread_id);
+        }
+
+        let root_thread_id = self
+            .state
+            .agent_id_for_path(&AgentPath::root())
+            .or_else(|| current_agent_path.is_root().then_some(current_thread_id));
+        if let (Some(root_thread_id), Ok(state)) = (root_thread_id, self.upgrade())
+            && let Some(agent_graph_store) = state.agent_graph_store()
+        {
+            let thread_id = agent_graph_store
+                .find_thread_spawn_descendant_by_path(root_thread_id, agent_path.as_str())
+                .await
+                .map_err(|err| {
+                    CodexErr::Fatal(format!(
+                        "failed to resolve persisted agent path `{agent_path}`: {err}"
+                    ))
+                })?;
+            let open_descendants = agent_graph_store
+                .list_thread_spawn_descendants(
+                    root_thread_id,
+                    Some(codex_agent_graph_store::ThreadSpawnEdgeStatus::Open),
+                )
+                .await
+                .map_err(|err| {
+                    CodexErr::Fatal(format!(
+                        "failed to resolve persisted agent path `{agent_path}`: {err}"
+                    ))
+                })?;
+            if let Some(thread_id) = thread_id.filter(|id| open_descendants.contains(id)) {
+                let stored_thread = state
+                    .read_stored_thread(ReadThreadParams {
+                        thread_id,
+                        include_archived: true,
+                        include_history: false,
+                    })
+                    .await?;
+                self.state.register_restored_thread(AgentMetadata {
+                    agent_id: Some(thread_id),
+                    agent_path: Some(agent_path.clone()),
+                    agent_nickname: stored_thread.agent_nickname,
+                    agent_role: stored_thread.agent_role,
+                    last_task_message: None,
+                });
+                if self.state.agent_id_for_path(&agent_path) == Some(thread_id) {
+                    return Ok(thread_id);
+                }
+            }
         }
         Err(CodexErr::UnsupportedOperation(format!(
             "live agent path `{}` not found",
@@ -457,7 +513,7 @@ impl AgentControl {
     ///
     /// This is only enabled for `SubAgentSource::ThreadSpawn`, where a parent thread exists and
     /// can receive completion notifications.
-    fn maybe_start_completion_watcher(
+    async fn maybe_start_completion_watcher(
         &self,
         child_thread_id: ThreadId,
         session_source: Option<SessionSource>,
@@ -471,8 +527,33 @@ impl AgentControl {
             return;
         };
         let control = self.clone();
+        let external_completion_rx = match control.upgrade() {
+            Ok(state) => state
+                .get_thread(child_thread_id)
+                .await
+                .ok()
+                .and_then(|thread| thread.subscribe_external_completions()),
+            Err(_) => None,
+        };
+        if let Some(mut completion_rx) = external_completion_rx {
+            tokio::spawn(async move {
+                while let Ok(status) = completion_rx.recv().await {
+                    control
+                        .notify_parent_of_completion(
+                            child_thread_id,
+                            parent_thread_id,
+                            &child_reference,
+                            child_agent_path.as_ref(),
+                            &status,
+                        )
+                        .await;
+                }
+            });
+            return;
+        }
+        let status_rx = control.subscribe_status(child_thread_id).await;
         tokio::spawn(async move {
-            let status = match control.subscribe_status(child_thread_id).await {
+            let status = match status_rx {
                 Ok(mut status_rx) => {
                     let mut status = status_rx.borrow().clone();
                     while !is_final(&status) {
@@ -486,60 +567,72 @@ impl AgentControl {
                 }
                 Err(_) => control.get_status(child_thread_id).await,
             };
-            if !is_final(&status) {
-                return;
-            }
-
-            let Ok(state) = control.upgrade() else {
-                return;
-            };
-            let child_thread = state.get_thread(child_thread_id).await.ok();
-            let child_uses_multi_agent_v2 = match child_thread.as_ref() {
-                Some(child_thread) => {
-                    child_thread.multi_agent_version() == Some(MultiAgentVersion::V2)
-                }
-                None => true,
-            };
-            if child_agent_path.is_some() && child_uses_multi_agent_v2 {
-                let Some(child_agent_path) = child_agent_path.clone() else {
-                    return;
-                };
-                let Some(parent_agent_path) = child_agent_path
-                    .as_str()
-                    .rsplit_once('/')
-                    .and_then(|(parent, _)| AgentPath::try_from(parent).ok())
-                else {
-                    return;
-                };
-                let Some(message) = format_inter_agent_completion_message(
-                    parent_agent_path.clone(),
-                    child_agent_path.clone(),
-                    &status,
-                ) else {
-                    return;
-                };
-                let communication = InterAgentCommunication::new(
-                    child_agent_path,
-                    parent_agent_path,
-                    Vec::new(),
-                    message,
-                    /*trigger_turn*/ false,
-                );
-                let context =
-                    AgentCommunicationContext::new(AgentCommunicationKind::Result, child_thread_id);
-                let _ = control
-                    .send_inter_agent_communication(parent_thread_id, communication, context)
+            if is_final(&status) {
+                control
+                    .notify_parent_of_completion(
+                        child_thread_id,
+                        parent_thread_id,
+                        &child_reference,
+                        child_agent_path.as_ref(),
+                        &status,
+                    )
                     .await;
-                return;
             }
-            let message = format_subagent_notification_message(child_reference.as_str(), &status);
-            let Ok(parent_thread) = state.get_thread(parent_thread_id).await else {
+        });
+    }
+
+    async fn notify_parent_of_completion(
+        &self,
+        child_thread_id: ThreadId,
+        parent_thread_id: ThreadId,
+        child_reference: &str,
+        child_agent_path: Option<&AgentPath>,
+        status: &AgentStatus,
+    ) {
+        let Ok(state) = self.upgrade() else {
+            return;
+        };
+        let child_thread = state.get_thread(child_thread_id).await.ok();
+        let child_uses_multi_agent_v2 = match child_thread.as_ref() {
+            Some(child_thread) => child_thread.multi_agent_version() == Some(MultiAgentVersion::V2),
+            None => true,
+        };
+        if let Some(child_agent_path) = child_agent_path.filter(|_| child_uses_multi_agent_v2) {
+            let Some(parent_agent_path) = child_agent_path
+                .as_str()
+                .rsplit_once('/')
+                .and_then(|(parent, _)| AgentPath::try_from(parent).ok())
+            else {
                 return;
             };
-            parent_thread
-                .inject_user_message_without_turn(message)
+            let Some(message) = format_inter_agent_completion_message(
+                parent_agent_path.clone(),
+                child_agent_path.clone(),
+                status,
+            ) else {
+                return;
+            };
+            let communication = InterAgentCommunication::new(
+                child_agent_path.clone(),
+                parent_agent_path,
+                Vec::new(),
+                message,
+                /*trigger_turn*/ false,
+            );
+            let context =
+                AgentCommunicationContext::new(AgentCommunicationKind::Result, child_thread_id);
+            let _ = self
+                .send_inter_agent_communication(parent_thread_id, communication, context)
                 .await;
-        });
+            return;
+        }
+        let message = format_subagent_notification_message(child_reference, status);
+        let Ok(parent_thread) = state.get_thread(parent_thread_id).await else {
+            return;
+        };
+        parent_thread
+            .inject_user_message_without_turn(message)
+            .await;
     }
 
     #[allow(clippy::too_many_arguments)]

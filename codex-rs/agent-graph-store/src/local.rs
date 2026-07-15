@@ -107,6 +107,20 @@ impl AgentGraphStore for LocalAgentGraphStore {
             }
         })
     }
+
+    fn find_thread_spawn_descendant_by_path(
+        &self,
+        root_thread_id: ThreadId,
+        agent_path: &str,
+    ) -> AgentGraphStoreFuture<'_, Option<ThreadId>> {
+        let agent_path = agent_path.to_string();
+        Box::pin(async move {
+            self.state_db
+                .find_thread_spawn_descendant_by_path(root_thread_id, &agent_path)
+                .await
+                .map_err(internal_error)
+        })
+    }
 }
 
 fn to_state_status(status: ThreadSpawnEdgeStatus) -> codex_state::DirectionalThreadSpawnEdgeStatus {

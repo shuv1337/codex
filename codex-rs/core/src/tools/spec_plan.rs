@@ -842,13 +842,20 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
                     ),
                     exposure,
                 ));
+                planned_tools.add_arc(override_tool_exposure(
+                    multi_agent_v2_handler(
+                        FollowupTaskHandlerV2::new_external_runtime(),
+                        Some(EXTERNAL_AGENT_RUNTIME_NAMESPACE),
+                    ),
+                    exposure,
+                ));
             }
             planned_tools.add_arc(override_tool_exposure(
                 multi_agent_v2_handler(SendMessageHandlerV2, tool_namespace),
                 exposure,
             ));
             planned_tools.add_arc(override_tool_exposure(
-                multi_agent_v2_handler(FollowupTaskHandlerV2, tool_namespace),
+                multi_agent_v2_handler(FollowupTaskHandlerV2::default(), tool_namespace),
                 exposure,
             ));
             planned_tools.add_arc(override_tool_exposure(

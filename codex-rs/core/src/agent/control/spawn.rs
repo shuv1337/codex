@@ -191,6 +191,7 @@ impl AgentControl {
         let (session_source, _) = initial_history
             .get_resumed_session_sources()
             .unwrap_or((stored_source, None));
+        let notification_source = session_source.clone();
         let parent_thread_id = initial_history
             .get_resumed_parent_thread_id()
             .or(stored_parent_thread_id);
@@ -216,6 +217,24 @@ impl AgentControl {
             Ok(reloaded_thread) => {
                 residency_slot.commit(reloaded_thread.thread_id);
                 state.notify_thread_created(reloaded_thread.thread_id);
+                if reloaded_thread.thread.as_codex_thread().is_none() {
+                    let metadata = self
+                        .state
+                        .agent_metadata_for_thread(reloaded_thread.thread_id)
+                        .unwrap_or_default();
+                    let child_reference = metadata
+                        .agent_path
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| reloaded_thread.thread_id.to_string());
+                    self.maybe_start_completion_watcher(
+                        reloaded_thread.thread_id,
+                        Some(notification_source),
+                        child_reference,
+                        metadata.agent_path,
+                    )
+                    .await;
+                }
                 Ok(())
             }
             Err(err) => {
@@ -364,7 +383,8 @@ impl AgentControl {
                     notification_source,
                     child_reference,
                     agent_metadata.agent_path.clone(),
-                );
+                )
+                .await;
                 return Ok(LiveAgent {
                     thread_id,
                     metadata: agent_metadata,
@@ -501,7 +521,8 @@ impl AgentControl {
                 notification_source,
                 child_reference,
                 agent_metadata.agent_path.clone(),
-            );
+            )
+            .await;
         }
 
         Ok(LiveAgent {
@@ -847,7 +868,8 @@ impl AgentControl {
                 Some(notification_source.clone()),
                 child_reference,
                 agent_metadata.agent_path.clone(),
-            );
+            )
+            .await;
         }
         if let Some(native_thread) = resumed_thread.thread.as_codex_thread() {
             self.persist_thread_spawn_edge_for_source(

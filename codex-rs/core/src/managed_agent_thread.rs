@@ -21,6 +21,7 @@ use codex_thread_store::LiveThread;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use tokio::sync::broadcast;
 use tokio::sync::watch;
 
 /// Runtime-neutral handle for a loaded agent thread.
@@ -42,6 +43,7 @@ pub struct ExternalAgentThread {
     multi_agent_version: Option<MultiAgentVersion>,
     next_submission_id: AtomicU64,
     status_tx: watch::Sender<AgentStatus>,
+    completion_tx: broadcast::Sender<AgentStatus>,
     host_tools: Option<Arc<ExternalHostTools>>,
     host_tool_driver: Option<tokio::task::JoinHandle<()>>,
     persistence: Option<LiveThread>,
@@ -63,6 +65,7 @@ impl ManagedAgentThread {
     ) -> CodexResult<Self> {
         let status = runtime.status().await.map_err(runtime_error)?;
         let (status_tx, _) = watch::channel(status);
+        let (completion_tx, _) = broadcast::channel(16);
         let host_tool_driver = host_tools.as_ref().map(|host_tools| {
             tokio::spawn(run_host_tool_driver(
                 Arc::clone(&runtime),
@@ -77,6 +80,7 @@ impl ManagedAgentThread {
             multi_agent_version,
             next_submission_id: AtomicU64::new(0),
             status_tx,
+            completion_tx,
             host_tools,
             host_tool_driver,
             persistence,
@@ -120,7 +124,7 @@ impl ManagedAgentThread {
                         .submit_response(op)
                         .await;
                 }
-                let is_shutdown = matches!(&op, Op::Shutdown { .. });
+                let is_shutdown = matches!(&op, Op::Shutdown);
                 let sequence = thread.next_submission_id.fetch_add(1, Ordering::Relaxed);
                 let submission_id = format!("external-{}-{sequence}", thread.runtime.thread_id());
                 if matches!(
@@ -172,7 +176,13 @@ impl ManagedAgentThread {
                         .ok_or(CodexErr::InternalAgentDied)?
                 };
                 if let Some(status) = agent_status_from_event(&event.msg) {
-                    thread.status_tx.send_replace(status);
+                    thread.status_tx.send_replace(status.clone());
+                    if matches!(
+                        status,
+                        AgentStatus::Completed(_) | AgentStatus::Errored(_) | AgentStatus::Shutdown
+                    ) {
+                        let _ = thread.completion_tx.send(status);
+                    }
                 }
                 if let Some(persistence) = thread.persistence.as_ref() {
                     let mut rollout_items = vec![RolloutItem::EventMsg(event.msg.clone())];
@@ -218,6 +228,15 @@ impl ManagedAgentThread {
         match self {
             Self::Codex(thread) => thread.subscribe_status(),
             Self::External(thread) => thread.status_tx.subscribe(),
+        }
+    }
+
+    pub(crate) fn subscribe_external_completions(
+        &self,
+    ) -> Option<broadcast::Receiver<AgentStatus>> {
+        match self {
+            Self::Codex(_) => None,
+            Self::External(thread) => Some(thread.completion_tx.subscribe()),
         }
     }
 

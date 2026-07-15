@@ -11,6 +11,7 @@ use crate::session::turn_context::TurnContext;
 use crate::session_prefix::format_inter_agent_completion_message;
 use crate::thread_manager::thread_store_from_config;
 use crate::tools::context::ToolOutput;
+use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
 use crate::tools::handlers::multi_agents_v2::FollowupTaskHandler as FollowupTaskHandlerV2;
 use crate::tools::handlers::multi_agents_v2::InterruptAgentHandler;
 use crate::tools::handlers::multi_agents_v2::ListAgentsHandler as ListAgentsHandlerV2;
@@ -18,6 +19,14 @@ use crate::tools::handlers::multi_agents_v2::SendMessageHandler as SendMessageHa
 use crate::tools::handlers::multi_agents_v2::SpawnAgentHandler as SpawnAgentHandlerV2;
 use crate::tools::handlers::multi_agents_v2::WaitAgentHandler as WaitAgentHandlerV2;
 use crate::turn_diff_tracker::TurnDiffTracker;
+use codex_extension_api::AgentRuntimeFuture;
+use codex_extension_api::AgentRuntimeId;
+use codex_extension_api::AgentRuntimeOperation;
+use codex_extension_api::AgentRuntimePersistence;
+use codex_extension_api::AgentRuntimeProvider;
+use codex_extension_api::AgentRuntimeResumeRequest;
+use codex_extension_api::AgentRuntimeSpawnRequest;
+use codex_extension_api::AgentRuntimeThread;
 use codex_extension_api::empty_extension_registry;
 use codex_features::Feature;
 use codex_login::AuthManager;
@@ -39,6 +48,7 @@ use codex_protocol::models::SandboxEnforcement;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::FileSystemAccessMode;
 use codex_protocol::protocol::FileSystemPath;
@@ -52,6 +62,7 @@ use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
@@ -104,6 +115,110 @@ fn thread_manager() -> ThreadManager {
         CodexAuth::from_api_key("dummy"),
         built_in_model_providers(/* openai_base_url */ /*openai_base_url*/ None)["openai"].clone(),
     )
+}
+
+struct RecordingExternalThread {
+    thread_id: ThreadId,
+    runtime_id: AgentRuntimeId,
+    operations: std::sync::Mutex<Vec<AgentRuntimeOperation>>,
+}
+
+impl AgentRuntimeThread for RecordingExternalThread {
+    fn thread_id(&self) -> ThreadId {
+        self.thread_id
+    }
+
+    fn runtime_id(&self) -> &AgentRuntimeId {
+        &self.runtime_id
+    }
+
+    fn submit(&self, operation: AgentRuntimeOperation) -> AgentRuntimeFuture<'_, ()> {
+        Box::pin(async move {
+            self.operations
+                .lock()
+                .expect("external operations lock")
+                .push(operation);
+            Ok(())
+        })
+    }
+
+    fn next_event(&self) -> AgentRuntimeFuture<'_, Option<Event>> {
+        Box::pin(std::future::pending())
+    }
+
+    fn status(&self) -> AgentRuntimeFuture<'_, AgentStatus> {
+        Box::pin(async { Ok(AgentStatus::PendingInit) })
+    }
+
+    fn token_usage(&self) -> AgentRuntimeFuture<'_, Option<TokenUsageInfo>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn persistence(&self) -> AgentRuntimeFuture<'_, AgentRuntimePersistence> {
+        Box::pin(async move {
+            Ok(AgentRuntimePersistence {
+                runtime_id: self.runtime_id.clone(),
+                session_locator: self.thread_id.to_string(),
+                metadata: json!({}),
+            })
+        })
+    }
+
+    fn shutdown(&self) -> AgentRuntimeFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+struct RecordingExternalProvider {
+    runtime_id: AgentRuntimeId,
+    spawn_count: std::sync::atomic::AtomicUsize,
+    last_thread: std::sync::Mutex<Option<Arc<RecordingExternalThread>>>,
+}
+
+impl RecordingExternalProvider {
+    fn new() -> Self {
+        Self {
+            runtime_id: AgentRuntimeId::new("fake").expect("valid runtime id"),
+            spawn_count: std::sync::atomic::AtomicUsize::new(0),
+            last_thread: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn thread(&self, thread_id: ThreadId) -> Arc<RecordingExternalThread> {
+        Arc::new(RecordingExternalThread {
+            thread_id,
+            runtime_id: self.runtime_id.clone(),
+            operations: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+}
+
+impl AgentRuntimeProvider for RecordingExternalProvider {
+    fn id(&self) -> &AgentRuntimeId {
+        &self.runtime_id
+    }
+
+    fn spawn(
+        &self,
+        request: AgentRuntimeSpawnRequest,
+    ) -> AgentRuntimeFuture<'_, Arc<dyn AgentRuntimeThread>> {
+        let thread = self.thread(request.thread_id);
+        self.spawn_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *self.last_thread.lock().expect("external thread lock") = Some(Arc::clone(&thread));
+        let runtime: Arc<dyn AgentRuntimeThread> = thread;
+        Box::pin(async move { Ok(runtime) })
+    }
+
+    fn resume(
+        &self,
+        request: AgentRuntimeResumeRequest,
+    ) -> AgentRuntimeFuture<'_, Arc<dyn AgentRuntimeThread>> {
+        let thread = self.thread(request.thread_id);
+        *self.last_thread.lock().expect("external thread lock") = Some(Arc::clone(&thread));
+        let runtime: Arc<dyn AgentRuntimeThread> = thread;
+        Box::pin(async move { Ok(runtime) })
+    }
 }
 
 async fn install_role_with_model_override(turn: &mut TurnContext) -> String {
@@ -967,6 +1082,219 @@ async fn multi_agent_v2_full_history_fork_accepts_explicit_service_tier() {
 }
 
 #[tokio::test]
+async fn multi_agent_v2_spawn_uses_request_step_environments() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let step_environments = turn.environments.clone();
+    let expected_selections = step_environments.to_selections();
+    assert!(!expected_selections.is_empty());
+    turn.environments = Default::default();
+
+    let manager = thread_manager();
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    set_turn_config(&mut turn, config);
+    let root = manager
+        .start_thread((*turn.config).clone())
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let step_context = Arc::new(StepContext::new(
+        Arc::clone(&turn),
+        step_environments,
+        Vec::new(),
+        crate::session::McpRuntimeSnapshot::new_uninitialized_for_test(&turn.config),
+        /*loaded_agents_md*/ None,
+    ));
+    let mut spawn_invocation = invocation(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        "spawn_agent",
+        function_payload(json!({
+            "message": "inspect this repo",
+            "task_name": "step_environment_worker",
+            "fork_turns": "none"
+        })),
+    );
+    spawn_invocation.step_context = step_context;
+
+    SpawnAgentHandlerV2::default()
+        .handle(spawn_invocation)
+        .await
+        .expect("spawn_agent should succeed");
+    let child_thread_id = session
+        .services
+        .agent_control
+        .resolve_agent_reference(
+            session.thread_id,
+            &turn.session_source,
+            "step_environment_worker",
+        )
+        .await
+        .expect("spawned task name should resolve");
+    let snapshot = manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("spawned agent thread should exist")
+        .config_snapshot()
+        .await;
+
+    assert_eq!(snapshot.environments.environments, expected_selections);
+}
+
+#[tokio::test]
+async fn multi_agent_v2_runtime_followup_sends_plaintext_without_spawning_replacement() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let provider = Arc::new(RecordingExternalProvider::new());
+    let provider_trait: Arc<dyn AgentRuntimeProvider> = provider.clone();
+    manager
+        .register_agent_runtime_provider(provider_trait)
+        .expect("register external runtime");
+    let mut config = turn.config.as_ref().clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("enable multi-agent v2");
+    config.agent_roles.insert(
+        "external-worker".to_string(),
+        AgentRoleConfig {
+            description: Some("External worker".to_string()),
+            runtime: Some("fake".to_string()),
+            ..Default::default()
+        },
+    );
+    set_turn_config(&mut turn, config);
+    let root = manager
+        .start_thread((*turn.config).clone())
+        .await
+        .expect("root thread should start");
+    root.thread.codex.session.new_default_turn().await;
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    SpawnAgentHandlerV2::new_external_runtime(SpawnAgentToolOptions::default())
+        .handle(invocation(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "spawn_agent",
+            function_payload(json!({
+                "agent_type": "external-worker",
+                "message": "boot externally",
+                "task_name": "external",
+                "fork_turns": "none"
+            })),
+        ))
+        .await
+        .expect("external spawn should succeed");
+    let agent_id = session
+        .services
+        .agent_control
+        .resolve_agent_reference(session.thread_id, &turn.session_source, "external")
+        .await
+        .expect("external agent should resolve");
+
+    FollowupTaskHandlerV2::new_external_runtime()
+        .handle(invocation(
+            session,
+            turn,
+            "followup_task",
+            function_payload(json!({
+                "target": "/root/external",
+                "message": "continue externally"
+            })),
+        ))
+        .await
+        .expect("external follow-up should succeed");
+
+    assert_eq!(
+        provider
+            .spawn_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "follow-up must reuse the existing external thread"
+    );
+    let thread = provider
+        .last_thread
+        .lock()
+        .expect("external thread lock")
+        .clone()
+        .expect("external thread should exist");
+    let operations = thread.operations.lock().expect("external operations lock");
+    assert!(operations.iter().any(|operation| {
+        matches!(
+            &operation.op,
+            Op::InterAgentCommunication { communication }
+                if communication.recipient.as_str() == "/root/external"
+                    && communication.content == "continue externally"
+                    && communication.encrypted_content.is_none()
+                    && communication.trigger_turn
+        )
+    }));
+    assert_eq!(thread.thread_id, agent_id);
+}
+
+#[tokio::test]
+async fn multi_agent_v2_runtime_followup_rejects_native_target() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let mut config = turn.config.as_ref().clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("enable multi-agent v2");
+    set_turn_config(&mut turn, config);
+    let root = manager
+        .start_thread((*turn.config).clone())
+        .await
+        .expect("root thread should start");
+    root.thread.codex.session.new_default_turn().await;
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    SpawnAgentHandlerV2::default()
+        .handle(invocation(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "boot native",
+                "task_name": "native"
+            })),
+        ))
+        .await
+        .expect("native spawn should succeed");
+    let result = FollowupTaskHandlerV2::new_external_runtime()
+        .handle(invocation(
+            session,
+            turn,
+            "followup_task",
+            function_payload(json!({
+                "target": "/root/native",
+                "message": "must be rejected"
+            })),
+        ))
+        .await;
+    let Err(error) = result else {
+        panic!("runtime follow-up must reject native target");
+    };
+
+    assert_eq!(
+        error.to_string(),
+        "runtime_agents.followup_task requires an external-runtime target; `/root/native` resolves to native Codex"
+    );
+}
+
+#[tokio::test]
 async fn multi_agent_v2_spawn_partial_fork_turns_allows_agent_type_override() {
     let (mut session, mut turn) = make_session_and_context().await;
     let role_name = install_role_with_model_override(&mut turn).await;
@@ -1484,7 +1812,7 @@ async fn multi_agent_v2_followup_task_rejects_root_target_from_child() {
         agent_role: None,
     });
 
-    let Err(err) = FollowupTaskHandlerV2
+    let Err(err) = FollowupTaskHandlerV2::default()
         .handle(invocation(
             Arc::new(session),
             Arc::new(turn),
@@ -2027,7 +2355,7 @@ async fn multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn()
         )
         .await;
 
-    FollowupTaskHandlerV2
+    FollowupTaskHandlerV2::default()
         .handle(invocation(
             session,
             turn,
@@ -2168,7 +2496,7 @@ async fn multi_agent_v2_followup_task_rejects_legacy_items_field() {
         })),
     );
 
-    let Err(err) = FollowupTaskHandlerV2.handle(invocation).await else {
+    let Err(err) = FollowupTaskHandlerV2::default().handle(invocation).await else {
         panic!("legacy items field should be rejected in v2");
     };
     let FunctionCallError::RespondToModel(message) = err else {

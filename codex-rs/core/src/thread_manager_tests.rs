@@ -79,6 +79,14 @@ impl codex_agent_graph_store::AgentGraphStore for FakeAgentGraphStore {
         let descendant_thread_ids = self.descendant_thread_ids.clone();
         Box::pin(async move { Ok(descendant_thread_ids) })
     }
+
+    fn find_thread_spawn_descendant_by_path(
+        &self,
+        _root_thread_id: ThreadId,
+        _agent_path: &str,
+    ) -> codex_agent_graph_store::AgentGraphStoreFuture<'_, Option<ThreadId>> {
+        Box::pin(async { panic!("unexpected descendant path lookup") })
+    }
 }
 
 fn user_msg(text: &str) -> ResponseItem {

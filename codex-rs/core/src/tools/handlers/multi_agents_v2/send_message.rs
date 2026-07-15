@@ -1,4 +1,5 @@
 use super::message_tool::MessageDeliveryMode;
+use super::message_tool::MessageTargetKind;
 use super::message_tool::SendMessageArgs;
 use super::message_tool::handle_message_string_tool;
 use super::*;
@@ -31,6 +32,7 @@ impl Handler {
         handle_message_string_tool(
             invocation,
             MessageDeliveryMode::QueueOnly,
+            MessageTargetKind::Any,
             args.target,
             args.message,
         )

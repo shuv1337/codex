@@ -176,15 +176,16 @@ fn host_tool_definition(spec: ToolSpec) -> Option<CodexResult<AgentRuntimeHostTo
         ToolSpec::Freeform(tool) if tool.name == "apply_patch" => {
             Some(Ok(AgentRuntimeHostToolDefinition {
                 name: tool.name,
-                description:
-                    "Apply a patch through Codex's native sandbox, approval, and diff pipeline."
-                        .to_string(),
+                description: format!(
+                    "Apply a patch through Codex's native sandbox, approval, and diff pipeline. {} The patch must start with the exact line `*** Begin Patch` and end with the exact line `*** End Patch`; directive lines must not have trailing `***`.",
+                    tool.description
+                ),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
                         "patch": {
                             "type": "string",
-                            "description": tool.description
+                            "description": "Full Codex patch text. Example: `*** Begin Patch\n*** Add File: path/to/file\n+content\n*** End Patch`. Use each directive exactly as shown, with no trailing `***`."
                         }
                     },
                     "required": ["patch"],

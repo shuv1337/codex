@@ -133,6 +133,7 @@ struct AgentControlHarness {
 struct ScriptedExternalThread {
     thread_id: ThreadId,
     runtime_id: AgentRuntimeId,
+    initial_status: AgentStatus,
     events: std::sync::Mutex<VecDeque<Event>>,
     operations: std::sync::Mutex<Vec<AgentRuntimeOperation>>,
 }
@@ -167,7 +168,7 @@ impl AgentRuntimeThread for ScriptedExternalThread {
     }
 
     fn status(&self) -> AgentRuntimeFuture<'_, AgentStatus> {
-        Box::pin(async { Ok(AgentStatus::PendingInit) })
+        Box::pin(async { Ok(self.initial_status.clone()) })
     }
 
     fn token_usage(&self) -> AgentRuntimeFuture<'_, Option<TokenUsageInfo>> {
@@ -211,10 +212,12 @@ impl ScriptedExternalProvider {
         thread_id: ThreadId,
         turn_id: &str,
         final_message: &str,
+        initial_status: AgentStatus,
     ) -> Arc<ScriptedExternalThread> {
         Arc::new(ScriptedExternalThread {
             thread_id,
             runtime_id: self.runtime_id.clone(),
+            initial_status,
             events: std::sync::Mutex::new(
                 vec![
                     Event {
@@ -256,7 +259,12 @@ impl AgentRuntimeProvider for ScriptedExternalProvider {
         &self,
         request: AgentRuntimeSpawnRequest,
     ) -> AgentRuntimeFuture<'_, Arc<dyn AgentRuntimeThread>> {
-        let thread = self.scripted_thread(request.thread_id, "turn-1", "external done");
+        let thread = self.scripted_thread(
+            request.thread_id,
+            "turn-1",
+            "external done",
+            AgentStatus::PendingInit,
+        );
         self.requests
             .lock()
             .expect("external requests lock")
@@ -270,7 +278,12 @@ impl AgentRuntimeProvider for ScriptedExternalProvider {
         &self,
         request: AgentRuntimeResumeRequest,
     ) -> AgentRuntimeFuture<'_, Arc<dyn AgentRuntimeThread>> {
-        let thread = self.scripted_thread(request.thread_id, "turn-2", "external resumed");
+        let thread = self.scripted_thread(
+            request.thread_id,
+            "turn-2",
+            "external resumed",
+            AgentStatus::Completed(Some("previous external result".to_string())),
+        );
         self.resume_requests
             .lock()
             .expect("external resume requests lock")
@@ -628,7 +641,7 @@ async fn external_runtime_spawns_managed_child_and_supports_lifecycle_operations
         .expect("shutdown external child");
     let operations = runtime.operations.lock().expect("external operations lock");
     assert_matches!(&operations[1].op, Op::Interrupt);
-    assert_matches!(&operations[2].op, Op::Shutdown { .. });
+    assert_matches!(&operations[2].op, Op::Shutdown);
     assert_eq!(child.agent_status().await, AgentStatus::Shutdown);
     match state.get_thread(child_thread_id).await {
         Err(CodexErr::ThreadNotFound(id)) => assert_eq!(id, child_thread_id),
@@ -754,7 +767,7 @@ async fn run_external_runtime_cold_resume_test() {
         .manager
         .register_agent_runtime_provider(provider_trait)
         .expect("register external runtime");
-    let (parent_thread_id, _parent_thread) = harness.start_thread().await;
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
     let agent_path = AgentPath::try_from("/root/external").expect("agent path");
     let spawned_agent = harness
         .control
@@ -788,6 +801,7 @@ async fn run_external_runtime_cold_resume_test() {
         next_external_turn_event(&child, true).await,
         EventMsg::TurnComplete(_)
     );
+    persist_thread_for_tree_resume(&parent_thread, "parent persisted").await;
     child
         .shutdown_and_wait()
         .await
@@ -801,50 +815,103 @@ async fn run_external_runtime_cold_resume_test() {
             .is_some()
     );
     drop(child);
-    harness
-        .control
-        .ensure_v2_agent_loaded(harness.config.clone(), spawned_agent.thread_id)
+
+    let report = harness
+        .manager
+        .shutdown_all_threads_bounded(Duration::from_secs(5))
+        .await;
+    assert_eq!(report.submit_failed, Vec::<ThreadId>::new());
+    assert_eq!(report.timed_out, Vec::<ThreadId>::new());
+    let resumed_manager = ThreadManager::with_models_provider_home_and_state_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        harness.config.model_provider.clone(),
+        harness.config.codex_home.to_path_buf(),
+        std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        harness.state_db.clone(),
+    );
+    let provider_trait: Arc<dyn AgentRuntimeProvider> = provider.clone();
+    resumed_manager
+        .register_agent_runtime_provider(provider_trait)
+        .expect("register external runtime on resumed manager");
+    let resumed_control = resumed_manager.agent_control();
+    resumed_control
+        .resume_agent_from_rollout(
+            harness.config.clone(),
+            parent_thread_id,
+            SessionSource::Exec,
+        )
+        .await
+        .expect("parent thread should resume");
+    resumed_control.register_session_root(parent_thread_id, /*current_parent_thread_id*/ None);
+    let resolved_thread_id = resumed_control
+        .resolve_agent_reference(parent_thread_id, &SessionSource::Exec, "/root/external")
+        .await
+        .expect("persisted external child path should resolve after root resume");
+    assert_eq!(resolved_thread_id, spawned_agent.thread_id);
+    resumed_control
+        .ensure_v2_agent_loaded(harness.config.clone(), resolved_thread_id)
         .await
         .expect("persisted external child should cold resume");
 
-    let resume_requests = provider
-        .resume_requests
-        .lock()
-        .expect("external resume requests lock");
-    assert_eq!(resume_requests.len(), 1);
-    assert_eq!(resume_requests[0].thread_id, spawned_agent.thread_id);
-    assert_eq!(resume_requests[0].parent_thread_id, Some(parent_thread_id));
-    assert_eq!(resume_requests[0].state.runtime_id.as_str(), "fake");
-    assert_eq!(
-        resume_requests[0].state.session_locator,
-        spawned_agent.thread_id.to_string()
-    );
-    drop(resume_requests);
+    {
+        let resume_requests = provider
+            .resume_requests
+            .lock()
+            .expect("external resume requests lock");
+        assert_eq!(resume_requests.len(), 1);
+        assert_eq!(resume_requests[0].thread_id, spawned_agent.thread_id);
+        assert_eq!(resume_requests[0].parent_thread_id, Some(parent_thread_id));
+        assert_eq!(resume_requests[0].state.runtime_id.as_str(), "fake");
+        assert_eq!(
+            resume_requests[0].state.session_locator,
+            spawned_agent.thread_id.to_string()
+        );
+    }
 
-    let resumed = harness
-        .manager
+    let resumed = resumed_manager
         .get_managed_thread(spawned_agent.thread_id)
         .await
         .expect("resumed external child");
     assert!(resumed.as_codex_thread().is_none());
-    harness
-        .control
-        .send_input(spawned_agent.thread_id, text_input("continue externally"))
+    assert_eq!(
+        resumed.multi_agent_version(),
+        Some(MultiAgentVersion::V2),
+        "resumed external child must retain v2 completion routing"
+    );
+    let followup = InterAgentCommunication::new(
+        AgentPath::root(),
+        AgentPath::try_from("/root/external").expect("agent path"),
+        Vec::new(),
+        "continue externally".to_string(),
+        /*trigger_turn*/ true,
+    );
+    resumed_control
+        .send_inter_agent_communication(
+            spawned_agent.thread_id,
+            followup.clone(),
+            AgentCommunicationContext::new(AgentCommunicationKind::Followup, parent_thread_id),
+        )
         .await
-        .expect("resumed external child accepts input");
+        .expect("resumed external child accepts plaintext follow-up");
     let resumed_runtime = provider
         .last_thread
         .lock()
         .expect("external thread lock")
         .clone()
         .expect("resumed external runtime thread");
-    let operations = resumed_runtime
-        .operations
-        .lock()
-        .expect("external operations lock");
-    assert_eq!(operations.len(), 1);
-    assert_matches!(&operations[0].op, Op::UserInput { .. });
-    drop(operations);
+    {
+        let operations = resumed_runtime
+            .operations
+            .lock()
+            .expect("external operations lock");
+        assert_eq!(operations.len(), 1);
+        assert_eq!(
+            operations[0].op,
+            Op::InterAgentCommunication {
+                communication: followup,
+            }
+        );
+    }
     assert_matches!(
         next_external_turn_event(&resumed, false).await,
         EventMsg::TurnStarted(_)
@@ -856,6 +923,37 @@ async fn run_external_runtime_cold_resume_test() {
     assert_eq!(
         resumed.agent_status().await,
         AgentStatus::Completed(Some("external resumed".to_string()))
+    );
+    let expected_completion = format_inter_agent_completion_message(
+        AgentPath::root(),
+        AgentPath::try_from("/root/external").expect("agent path"),
+        &AgentStatus::Completed(Some("external resumed".to_string())),
+    )
+    .expect("completion message");
+    let completion_result = timeout(Duration::from_secs(5), async {
+        loop {
+            if resumed_manager
+                .captured_ops()
+                .iter()
+                .any(|(thread_id, op)| {
+                    *thread_id == parent_thread_id
+                        && matches!(
+                            op,
+                            Op::InterAgentCommunication { communication }
+                                if communication.content == expected_completion
+                        )
+                })
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        completion_result.is_ok(),
+        "cold-resumed external follow-up should notify its parent; captured ops: {:?}",
+        resumed_manager.captured_ops()
     );
 }
 
@@ -1244,7 +1342,7 @@ async fn resume_agent_from_rollout_does_not_reopen_v2_descendants() {
                 depth: 2,
                 agent_path: Some(reviewer_path.clone()),
                 agent_nickname: None,
-                agent_role: Some("reviewer".to_string()),
+                agent_role: None,
             })),
         )
         .await
@@ -1298,6 +1396,20 @@ async fn resume_agent_from_rollout_does_not_reopen_v2_descendants() {
     );
     assert_thread_not_loaded(&resumed_manager, worker_thread_id).await;
     assert_thread_not_loaded(&resumed_manager, reviewer_thread_id).await;
+
+    resumed_control.register_session_root(parent_thread_id, /*current_parent_thread_id*/ None);
+    let resolved_worker_thread_id = resumed_control
+        .resolve_agent_reference(parent_thread_id, &SessionSource::Exec, worker_path.as_str())
+        .await
+        .expect("persisted v2 child path should resolve after root resume");
+    assert_eq!(resolved_worker_thread_id, worker_thread_id);
+    assert_eq!(
+        resumed_control
+            .ensure_agent_known(resolved_worker_thread_id)
+            .expect("resolved child should be restored in the registry")
+            .agent_path,
+        Some(worker_path)
+    );
 }
 
 #[tokio::test]
@@ -2623,18 +2735,21 @@ async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
         .expect("tester thread should exist");
     let worker_path = AgentPath::root().join("worker_a").expect("worker path");
     let tester_path = worker_path.join("tester").expect("tester path");
-    harness.control.maybe_start_completion_watcher(
-        tester_thread_id,
-        Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-            parent_thread_id: worker_thread_id,
-            depth: 2,
-            agent_path: Some(tester_path.clone()),
-            agent_nickname: None,
-            agent_role: Some("explorer".to_string()),
-        })),
-        tester_path.to_string(),
-        Some(tester_path.clone()),
-    );
+    harness
+        .control
+        .maybe_start_completion_watcher(
+            tester_thread_id,
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: worker_thread_id,
+                depth: 2,
+                agent_path: Some(tester_path.clone()),
+                agent_nickname: None,
+                agent_role: Some("explorer".to_string()),
+            })),
+            tester_path.to_string(),
+            Some(tester_path.clone()),
+        )
+        .await;
     let tester_turn = tester_thread.codex.session.new_default_turn().await;
     tester_thread
         .codex
@@ -2713,18 +2828,21 @@ async fn completion_watcher_notifies_parent_when_child_is_missing() {
     let (parent_thread_id, parent_thread) = harness.start_thread().await;
     let child_thread_id = ThreadId::new();
 
-    harness.control.maybe_start_completion_watcher(
-        child_thread_id,
-        Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-            parent_thread_id,
-            depth: 1,
-            agent_path: None,
-            agent_nickname: None,
-            agent_role: Some("explorer".to_string()),
-        })),
-        child_thread_id.to_string(),
-        /*child_agent_path*/ None,
-    );
+    harness
+        .control
+        .maybe_start_completion_watcher(
+            child_thread_id,
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: Some("explorer".to_string()),
+            })),
+            child_thread_id.to_string(),
+            /*child_agent_path*/ None,
+        )
+        .await;
 
     assert_eq!(wait_for_subagent_notification(&parent_thread).await, true);
 
@@ -3208,7 +3326,7 @@ async fn list_agent_subtree_thread_ids_includes_anonymous_and_closed_descendants
                 depth: 1,
                 agent_path: Some(reviewer_path),
                 agent_nickname: None,
-                agent_role: Some("reviewer".to_string()),
+                agent_role: None,
             })),
         )
         .await

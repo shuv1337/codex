@@ -57,4 +57,11 @@ pub trait AgentGraphStore: Send + Sync {
         root_thread_id: ThreadId,
         status_filter: Option<ThreadSpawnEdgeStatus>,
     ) -> AgentGraphStoreFuture<'_, Vec<ThreadId>>;
+
+    /// Find a spawned descendant of `root_thread_id` by canonical agent path.
+    fn find_thread_spawn_descendant_by_path(
+        &self,
+        root_thread_id: ThreadId,
+        agent_path: &str,
+    ) -> AgentGraphStoreFuture<'_, Option<ThreadId>>;
 }

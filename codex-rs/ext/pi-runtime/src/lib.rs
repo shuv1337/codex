@@ -115,6 +115,7 @@ mod tests {
     use codex_extension_api::AgentRuntimeOperation;
     use codex_extension_api::AgentRuntimeProvider;
     use codex_extension_api::AgentRuntimeToolResult;
+    use codex_protocol::AgentPath;
     use codex_protocol::ThreadId;
     use codex_protocol::protocol::AgentStatus;
     use codex_protocol::protocol::EventMsg;
@@ -133,7 +134,7 @@ mod tests {
         };
         let working_directory = tempfile::tempdir().expect("test working directory");
         let mut config = PiRuntimeConfig::new(executable);
-        config.arguments = vec![OsString::from(script)];
+        config.arguments = vec![script];
         config.environment.insert(
             OsString::from("PI_CODEX_RUNTIME_FAUX_RESPONSES_JSON"),
             OsString::from("[\"Hello from the real Pi SDK sidecar.\"]"),
@@ -245,7 +246,7 @@ mod tests {
         let parent_thread_id = ThreadId::new();
         let thread_id = ThreadId::new();
         let mut config = PiRuntimeConfig::new(executable);
-        config.arguments = vec![OsString::from(script)];
+        config.arguments = vec![script];
         config.environment.insert(
             OsString::from("PI_CODEX_RUNTIME_FAUX_RESPONSES_JSON"),
             OsString::from("[\"first reply\",\"resumed reply\"]"),
@@ -304,11 +305,15 @@ mod tests {
         resumed
             .submit(AgentRuntimeOperation {
                 submission_id: "pi-turn-after-reload".to_string(),
-                op: vec![UserInput::Text {
-                    text: "say resumed".to_string(),
-                    text_elements: Vec::new(),
-                }]
-                .into(),
+                op: codex_protocol::protocol::Op::InterAgentCommunication {
+                    communication: codex_protocol::protocol::InterAgentCommunication::new(
+                        AgentPath::root(),
+                        AgentPath::try_from("/root/pi_worker").expect("agent path"),
+                        Vec::new(),
+                        "say resumed".to_string(),
+                        /*trigger_turn*/ true,
+                    ),
+                },
             })
             .await
             .expect("submit resumed Pi turn");
@@ -337,7 +342,7 @@ mod tests {
         };
         let working_directory = tempfile::tempdir().expect("test working directory");
         let mut config = PiRuntimeConfig::new(executable);
-        config.arguments = vec![OsString::from(script)];
+        config.arguments = vec![script];
         config.environment.insert(
             OsString::from("PI_CODEX_RUNTIME_FAUX_RESPONSES_JSON"),
             OsString::from(

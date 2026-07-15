@@ -250,6 +250,38 @@ pub fn create_followup_task_tool() -> ToolSpec {
     })
 }
 
+pub fn create_external_runtime_followup_task_tool() -> ToolSpec {
+    let properties = BTreeMap::from([
+        (
+            "target".to_string(),
+            JsonSchema::string(Some(
+                "External-runtime agent id or canonical task name to send a follow-up task to."
+                    .to_string(),
+            )),
+        ),
+        (
+            "message".to_string(),
+            JsonSchema::string(Some(
+                "Plaintext task to send to the external-runtime agent.".to_string(),
+            )),
+        ),
+    ]);
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "followup_task".to_string(),
+        description: "Send a plaintext follow-up task to an existing external-runtime agent and trigger a turn if it is idle. Native Codex agents are not supported by this tool."
+            .to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::object(
+            properties,
+            Some(vec!["target".to_string(), "message".to_string()]),
+            Some(false.into()),
+        ),
+        output_schema: None,
+    })
+}
+
 pub fn create_resume_agent_tool() -> ToolSpec {
     let properties = BTreeMap::from([(
         "id".to_string(),

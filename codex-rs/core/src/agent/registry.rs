@@ -152,6 +152,26 @@ impl AgentRegistry {
             .cloned()
     }
 
+    pub(crate) fn register_restored_thread(&self, agent_metadata: AgentMetadata) {
+        let Some(agent_path) = agent_metadata.agent_path.as_ref() else {
+            return;
+        };
+        let mut active_agents = self
+            .active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if active_agents.agent_tree.contains_key(agent_path.as_str()) {
+            return;
+        }
+        if let Some(agent_nickname) = agent_metadata.agent_nickname.clone() {
+            active_agents.used_agent_nicknames.insert(agent_nickname);
+        }
+        active_agents
+            .agent_tree
+            .insert(agent_path.to_string(), agent_metadata);
+        self.total_count.fetch_add(1, Ordering::AcqRel);
+    }
+
     pub(crate) fn live_agents(&self) -> Vec<AgentMetadata> {
         self.active_agents
             .lock()

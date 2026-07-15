@@ -15,6 +15,12 @@ pub(crate) enum MessageDeliveryMode {
     TriggerTurn,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MessageTargetKind {
+    Any,
+    ExternalRuntime,
+}
+
 impl MessageDeliveryMode {
     /// Returns whether the produced communication should start a turn immediately.
     fn apply(self, communication: InterAgentCommunication) -> InterAgentCommunication {
@@ -60,6 +66,7 @@ pub(super) fn message_content(message: String) -> Result<String, FunctionCallErr
 pub(crate) async fn handle_message_string_tool(
     invocation: ToolInvocation,
     mode: MessageDeliveryMode,
+    target_kind: MessageTargetKind,
     target: String,
     message: String,
 ) -> Result<FunctionToolOutput, FunctionCallError> {
@@ -96,12 +103,34 @@ pub(crate) async fn handle_message_string_tool(
         .ensure_v2_agent_loaded(resume_config, receiver_thread_id)
         .await
         .map_err(|err| collab_agent_error(receiver_thread_id, err))?;
+    if target_kind == MessageTargetKind::ExternalRuntime
+        && !session
+            .services
+            .agent_control
+            .agent_uses_external_runtime(receiver_thread_id)
+            .await
+            .map_err(|err| collab_agent_error(receiver_thread_id, err))?
+    {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "runtime_agents.followup_task requires an external-runtime target; `{target}` resolves to native Codex"
+        )));
+    }
     let author = turn
         .session_source
         .get_agent_path()
         .unwrap_or_else(AgentPath::root);
-    let communication =
-        communication_from_tool_message(author, receiver_agent_path.clone(), message);
+    let communication = match target_kind {
+        MessageTargetKind::Any => {
+            communication_from_tool_message(author, receiver_agent_path.clone(), message)
+        }
+        MessageTargetKind::ExternalRuntime => InterAgentCommunication::new(
+            author,
+            receiver_agent_path.clone(),
+            Vec::new(),
+            message,
+            /*trigger_turn*/ true,
+        ),
+    };
     let kind = match mode {
         MessageDeliveryMode::QueueOnly => AgentCommunicationKind::Message,
         MessageDeliveryMode::TriggerTurn => AgentCommunicationKind::Followup,

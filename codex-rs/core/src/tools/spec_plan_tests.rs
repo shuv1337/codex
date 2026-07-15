@@ -1331,6 +1331,38 @@ async fn multi_agent_v2_adds_runtime_spawn_without_changing_reserved_spawn_schem
         "installing an external runtime role must not alter the full reserved collaboration.spawn_agent spec"
     );
 
+    let tool = |plan: &ToolPlanProbe, namespace_name: &str, tool_name: &str| {
+        let ToolSpec::Namespace(namespace) = plan.visible_spec(namespace_name) else {
+            panic!("expected {namespace_name} namespace");
+        };
+        namespace
+            .tools
+            .iter()
+            .find_map(|tool| match tool {
+                ResponsesApiNamespaceTool::Function(tool) if tool.name == tool_name => {
+                    Some(tool.clone())
+                }
+                ResponsesApiNamespaceTool::Function(_) => None,
+            })
+            .unwrap_or_else(|| panic!("expected {namespace_name}.{tool_name}"))
+    };
+    assert_eq!(
+        tool(&baseline, MULTI_AGENT_V2_NAMESPACE, "followup_task"),
+        tool(&plan, MULTI_AGENT_V2_NAMESPACE, "followup_task"),
+        "installing an external runtime role must not alter the full reserved collaboration.followup_task spec"
+    );
+    let runtime_followup = tool(&plan, EXTERNAL_AGENT_RUNTIME_NAMESPACE, "followup_task");
+    assert_eq!(
+        runtime_followup
+            .parameters
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get("message"))
+            .and_then(|schema| schema.encrypted),
+        None,
+        "runtime_agents.followup_task must expose plaintext message input"
+    );
+
     for (namespace_name, expects_runtime_metadata) in [
         (MULTI_AGENT_V2_NAMESPACE, false),
         (EXTERNAL_AGENT_RUNTIME_NAMESPACE, true),

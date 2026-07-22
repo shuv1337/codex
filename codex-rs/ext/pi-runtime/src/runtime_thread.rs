@@ -57,10 +57,11 @@ pub(crate) async fn spawn_thread(
     let session_id = request.thread_id.to_string();
     let registration = client.register_session(&session_id).await?;
     let runtime_config = request.runtime_config;
+    let agent_dir = config_string(&runtime_config, "agent_dir").unwrap_or_default();
     let command = proto::runtime_request::Command::Spawn(proto::SpawnRequest {
         codex_thread_id: session_id.clone(),
         cwd: request.cwd.as_path().display().to_string(),
-        agent_dir: config_string(&runtime_config, "agent_dir").unwrap_or_default(),
+        agent_dir: agent_dir.clone(),
         session_dir: config_string(&runtime_config, "session_dir").unwrap_or_default(),
         provider: config_string(&runtime_config, "provider").unwrap_or_default(),
         model: config_string(&runtime_config, "model")
@@ -83,6 +84,7 @@ pub(crate) async fn spawn_thread(
         request.thread_id,
         registration,
         spawned,
+        agent_dir,
     )))
 }
 
@@ -93,11 +95,19 @@ pub(crate) async fn resume_thread(
 ) -> Result<Arc<dyn AgentRuntimeThread>, AgentRuntimeError> {
     let session_id = request.thread_id.to_string();
     let registration = client.register_session(&session_id).await?;
+    let agent_dir = request
+        .state
+        .metadata
+        .get("agent_dir")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     let command = proto::runtime_request::Command::Resume(proto::ResumeRequest {
         codex_thread_id: session_id.clone(),
         session_locator: request.state.session_locator,
         cwd_override: request.cwd.as_path().display().to_string(),
         host_tools: encode_host_tools(request.host_tools)?,
+        agent_dir: agent_dir.clone(),
     });
     let response = match client.request(&session_id, command).await {
         Ok(response) => response,
@@ -113,6 +123,7 @@ pub(crate) async fn resume_thread(
         request.thread_id,
         registration,
         spawned,
+        agent_dir,
     )))
 }
 
@@ -125,6 +136,7 @@ struct PiRuntimeThread {
     provider: String,
     model: String,
     thinking_level: String,
+    agent_dir: String,
     events: Mutex<ThreadEvents>,
     host_tools: Mutex<mpsc::UnboundedReceiver<proto::HostToolRequest>>,
     pending_host_tools: Mutex<HashMap<String, String>>,
@@ -156,6 +168,7 @@ impl PiRuntimeThread {
         thread_id: ThreadId,
         registration: crate::client::RegisteredSession,
         spawned: proto::SpawnedSession,
+        agent_dir: String,
     ) -> Self {
         Self {
             client,
@@ -166,6 +179,7 @@ impl PiRuntimeThread {
             provider: spawned.provider,
             model: spawned.model,
             thinking_level: spawned.thinking_level,
+            agent_dir,
             events: Mutex::new(ThreadEvents {
                 receiver: registration.events,
                 queued: VecDeque::new(),
@@ -575,6 +589,7 @@ impl AgentRuntimeThread for PiRuntimeThread {
                     "provider": self.provider,
                     "model": self.model,
                     "thinking_level": self.thinking_level,
+                    "agent_dir": self.agent_dir,
                 }),
             })
         })

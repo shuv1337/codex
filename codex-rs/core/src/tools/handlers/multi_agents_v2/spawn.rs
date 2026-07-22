@@ -111,6 +111,12 @@ async fn handle_spawn_agent(
                 "runtime_agents.spawn_agent requires an external runtime role; agent_type `{role_name}` resolves to native Codex"
             )));
         }
+        if args.model.is_some() || args.reasoning_effort.is_some() || args.service_tier.is_some() {
+            return Err(FunctionCallError::RespondToModel(
+                "runtime_agents.spawn_agent selects provider, model, and thinking level from the agent role runtime_config; native model overrides are not supported"
+                    .to_string(),
+            ));
+        }
     }
     if let Some(service_tier) = args.service_tier.as_ref() {
         config.service_tier = Some(service_tier.clone());
@@ -223,8 +229,7 @@ async fn handle_spawn_agent(
                 .unwrap_or_default();
             let reasoning_effort = agent_snapshot
                 .as_ref()
-                .and_then(|snapshot| snapshot.reasoning_effort.clone())
-                .unwrap_or_default();
+                .and_then(|snapshot| snapshot.reasoning_effort.clone());
             let agent_role = agent_snapshot
                 .as_ref()
                 .and_then(|snapshot| snapshot.session_source.get_agent_role())
@@ -245,7 +250,7 @@ async fn handle_spawn_agent(
                         }],
                         prompt: Some(prompt),
                         model: Some(model),
-                        reasoning_effort: Some(reasoning_effort),
+                        reasoning_effort,
                         agents_states: [(new_thread_id, status)].into_iter().collect(),
                     }),
                 )

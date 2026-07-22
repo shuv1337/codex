@@ -24,7 +24,7 @@ use tokio::time::Instant;
 use tokio::time::sleep;
 use tokio::time::timeout;
 
-const PROTOCOL_VERSION: u32 = 1;
+const PROTOCOL_VERSION: u32 = 2;
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 pub(crate) struct PiRuntimeClient {

@@ -676,7 +676,7 @@ fn spawn_agent_common_properties_v2(
     } else {
         message_schema
     };
-    BTreeMap::from([
+    let mut properties = BTreeMap::from([
         ("message".to_string(), message_schema),
         (
             "agent_type".to_string(),
@@ -692,24 +692,27 @@ fn spawn_agent_common_properties_v2(
                         .to_string()
             })),
         ),
-        (
+    ]);
+    if !external_runtime_only {
+        properties.insert(
             "model".to_string(),
             JsonSchema::string(Some(SPAWN_AGENT_MODEL_OVERRIDE_DESCRIPTION.to_string())),
-        ),
-        (
+        );
+        properties.insert(
             "reasoning_effort".to_string(),
             JsonSchema::string(Some(
                 "Reasoning effort override for the new agent. Omit to inherit the parent effort."
                     .to_string(),
             )),
-        ),
-        (
+        );
+        properties.insert(
             "service_tier".to_string(),
             JsonSchema::string(Some(
                 SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION.to_string(),
             )),
-        ),
-    ])
+        );
+    }
+    properties
 }
 
 fn hide_spawn_agent_metadata_options(properties: &mut BTreeMap<String, JsonSchema>) {

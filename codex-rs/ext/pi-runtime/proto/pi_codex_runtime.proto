@@ -87,6 +87,7 @@ message ResumeRequest {
   string session_locator = 2;
   string cwd_override = 3;
   repeated HostToolDefinition host_tools = 4;
+  string agent_dir = 5;
 }
 
 message PromptRequest {

@@ -1363,7 +1363,7 @@ async fn multi_agent_v2_adds_runtime_spawn_without_changing_reserved_spawn_schem
         "runtime_agents.followup_task must expose plaintext message input"
     );
 
-    for (namespace_name, expects_runtime_metadata) in [
+    for (namespace_name, expects_external_runtime) in [
         (MULTI_AGENT_V2_NAMESPACE, false),
         (EXTERNAL_AGENT_RUNTIME_NAMESPACE, true),
     ] {
@@ -1386,21 +1386,22 @@ async fn multi_agent_v2_adds_runtime_spawn_without_changing_reserved_spawn_schem
             .as_ref()
             .expect("spawn_agent should use object params");
 
-        for property in ["agent_type", "model", "reasoning_effort", "service_tier"] {
-            assert_eq!(
-                properties.contains_key(property),
-                expects_runtime_metadata,
-                "unexpected `{property}` visibility in {namespace_name}.spawn_agent"
-            );
+        assert_eq!(
+            properties.contains_key("agent_type"),
+            expects_external_runtime,
+            "unexpected `agent_type` visibility in {namespace_name}.spawn_agent"
+        );
+        for property in ["model", "reasoning_effort", "service_tier"] {
+            assert!(!properties.contains_key(property));
         }
         assert_eq!(
             properties
                 .get("message")
                 .and_then(|schema| schema.encrypted),
-            (!expects_runtime_metadata).then_some(true),
+            (!expects_external_runtime).then_some(true),
             "unexpected message encryption in {namespace_name}.spawn_agent"
         );
-        if expects_runtime_metadata {
+        if expects_external_runtime {
             assert!(
                 spawn_agent
                     .parameters

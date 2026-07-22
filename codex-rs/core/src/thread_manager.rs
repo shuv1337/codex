@@ -1269,6 +1269,15 @@ impl ThreadManagerState {
             .to_string();
         config_snapshot.model = runtime_model.clone();
         config_snapshot.model_provider_id = runtime_provider.clone();
+        if let Some(thinking_level) = runtime_persistence
+            .metadata
+            .get("thinking_level")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            config_snapshot.reasoning_effort =
+                serde_json::from_value(serde_json::Value::String(thinking_level.to_string())).ok();
+        }
 
         let persistence = if config.ephemeral {
             None
@@ -1469,6 +1478,15 @@ impl ThreadManagerState {
             .to_string();
         config_snapshot.model = runtime_model.clone();
         config_snapshot.model_provider_id = runtime_provider.clone();
+        if let Some(thinking_level) = runtime_persistence
+            .metadata
+            .get("thinking_level")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            config_snapshot.reasoning_effort =
+                serde_json::from_value(serde_json::Value::String(thinking_level.to_string())).ok();
+        }
 
         let persistence = LiveThread::resume(
             Arc::clone(&self.thread_store),

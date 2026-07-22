@@ -155,6 +155,8 @@ pub struct ResumeRequest {
     pub cwd_override: ::prost::alloc::string::String,
     #[prost(message, repeated, tag = "4")]
     pub host_tools: ::prost::alloc::vec::Vec<HostToolDefinition>,
+    #[prost(string, tag = "5")]
+    pub agent_dir: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PromptRequest {

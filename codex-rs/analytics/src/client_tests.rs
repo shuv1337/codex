@@ -285,6 +285,7 @@ fn sample_thread(thread_id: &str) -> Thread {
         ephemeral: false,
         history_mode: Default::default(),
         model_provider: "openai".to_string(),
+        model: None,
         created_at: 1,
         updated_at: 2,
         recency_at: Some(2),

@@ -198,6 +198,7 @@ mod tests {
             ephemeral: false,
             history_mode: Default::default(),
             model_provider: "mock_provider".to_string(),
+            model: Some("mock_model".to_string()),
             created_at: 0,
             updated_at: 0,
             recency_at: Some(0),

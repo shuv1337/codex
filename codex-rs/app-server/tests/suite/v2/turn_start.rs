@@ -103,6 +103,7 @@ const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const TEST_ORIGINATOR: &str = "codex_vscode";
 const MULTI_AGENT_V2_NAMESPACE: &str = "collaboration";
+const EXTERNAL_AGENT_RUNTIME_NAMESPACE: &str = "runtime_agents";
 const INVALID_REQUEST_ERROR_CODE: i64 = -32600;
 const TINY_PNG_BYTES: &[u8] = &[
     137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0,
@@ -3730,6 +3731,154 @@ runtime = "fake""#,
 }
 
 #[tokio::test]
+async fn fake_external_runtime_spawn_emits_role_and_model_metadata_v2() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    const AGENT_ROLE: &str = "fake_worker";
+    const CHILD_PROMPT: &str = "child: run outside Codex";
+    const PARENT_PROMPT: &str = "spawn the fake external child";
+    const SPAWN_CALL_ID: &str = "spawn-fake-runtime-metadata";
+    const MODEL: &str = "gpt-5.4";
+
+    let server = responses::start_mock_server().await;
+    let spawn_args = serde_json::to_string(&json!({
+        "message": CHILD_PROMPT,
+        "agent_type": AGENT_ROLE,
+        "task_name": "external_metadata",
+    }))?;
+    let _parent_turn = responses::mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| body_contains(req, PARENT_PROMPT),
+        responses::sse(vec![
+            responses::ev_response_created("resp-fake-metadata-parent"),
+            responses::ev_function_call_with_namespace(
+                SPAWN_CALL_ID,
+                EXTERNAL_AGENT_RUNTIME_NAMESPACE,
+                "spawn_agent",
+                &spawn_args,
+            ),
+            responses::ev_completed("resp-fake-metadata-parent"),
+        ]),
+    )
+    .await;
+
+    let codex_home = TempDir::new()?;
+    let workspace = TempDir::new()?;
+    create_config_toml(
+        codex_home.path(),
+        &server.uri(),
+        "never",
+        &BTreeMap::from([(Feature::MultiAgentV2, true)]),
+    )?;
+    let config_path = codex_home.path().join("config.toml");
+    let base_config = std::fs::read_to_string(&config_path)?;
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"{base_config}
+
+[agents.{AGENT_ROLE}]
+description = "Deterministic external runtime test worker"
+runtime = "fake"
+"#,
+        ),
+    )?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .with_env_overrides(&[("CODEX_ENABLE_FAKE_AGENT_RUNTIME_FOR_TESTS", Some("1"))])
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let thread_req = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
+            model: Some(MODEL.to_string()),
+            cwd: Some(workspace.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        })
+        .await?;
+    let thread_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(thread_req)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(thread_resp)?;
+
+    let turn_req = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![V2UserInput::Text {
+                text: PARENT_PROMPT.to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let turn_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
+    )
+    .await??;
+    let _: TurnStartResponse = to_response::<TurnStartResponse>(turn_resp)?;
+
+    let spawn_completed = timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let completed_notif = mcp
+                .read_stream_until_notification_message("item/completed")
+                .await?;
+            let completed: ItemCompletedNotification =
+                serde_json::from_value(completed_notif.params.expect("item/completed params"))?;
+            if let ThreadItem::CollabAgentToolCall { id, .. } = &completed.item
+                && id == SPAWN_CALL_ID
+            {
+                return Ok::<ThreadItem, anyhow::Error>(completed.item);
+            }
+        }
+    })
+    .await??;
+    let ThreadItem::CollabAgentToolCall {
+        tool,
+        status,
+        receiver_thread_ids,
+        prompt,
+        model,
+        agents_states,
+        ..
+    } = spawn_completed
+    else {
+        unreachable!("loop only returns the external spawn item");
+    };
+    let child_thread_id = receiver_thread_ids
+        .first()
+        .cloned()
+        .expect("external spawn should include the child thread id");
+    assert_eq!(tool, CollabAgentTool::SpawnAgent);
+    assert_eq!(status, CollabAgentToolCallStatus::Completed);
+    assert_eq!(prompt.as_deref(), Some(CHILD_PROMPT));
+    assert_eq!(model.as_deref(), Some(MODEL));
+    assert!(agents_states.contains_key(&child_thread_id));
+
+    let read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: child_thread_id,
+            include_turns: false,
+        })
+        .await?;
+    let read_response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
+    )
+    .await??;
+    let ThreadReadResponse { thread: child } = to_response::<ThreadReadResponse>(read_response)?;
+    assert_eq!(child.agent_role.as_deref(), Some(AGENT_ROLE));
+    assert_eq!(child.model_provider, "mock_provider");
+    assert_eq!(child.model.as_deref(), Some(MODEL));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn pi_sdk_child_emits_native_app_server_events_v2() -> Result<()> {
     let (Some(executable), Some(script)) = (
         std::env::var_os("PI_RUNTIME_TEST_EXECUTABLE"),
@@ -4737,6 +4886,7 @@ async fn assert_external_runtime_child_emits_native_app_server_events_v2(
     assert_eq!(child_thread.agent_role.as_deref(), Some(agent_type));
     if agent_type == "pi_worker" {
         assert_eq!(child_thread.model_provider, "faux");
+        assert_eq!(child_thread.model.as_deref(), Some("faux-1"));
     }
     assert!(
         child_thread.turns.iter().any(|turn| {

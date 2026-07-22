@@ -2258,7 +2258,10 @@ impl ThreadRequestProcessor {
         thread_id: ThreadId,
         include_turns: bool,
     ) -> Result<Thread, ThreadReadViewError> {
-        let loaded_thread = self.thread_manager.get_thread(thread_id).await.ok();
+        let loaded_managed_thread = self.thread_manager.get_managed_thread(thread_id).await.ok();
+        let loaded_thread = loaded_managed_thread
+            .as_ref()
+            .and_then(|thread| thread.as_codex_thread());
         let mut thread = if include_turns {
             if let Some(loaded_thread) = loaded_thread.as_ref() {
                 // Loaded thread with turns: use persisted metadata when it exists,
@@ -2307,7 +2310,14 @@ impl ThreadRequestProcessor {
             )));
         };
 
-        let has_live_in_progress_turn = if let Some(loaded_thread) = loaded_thread.as_ref() {
+        if let Some(loaded_thread) = loaded_managed_thread.as_ref() {
+            let config_snapshot = loaded_thread.config_snapshot().await;
+            thread.model_provider = config_snapshot.model_provider_id;
+            thread.model = Some(config_snapshot.model);
+        }
+
+        let has_live_in_progress_turn = if let Some(loaded_thread) = loaded_managed_thread.as_ref()
+        {
             matches!(loaded_thread.agent_status().await, AgentStatus::Running)
         } else {
             false
@@ -4347,6 +4357,7 @@ pub(crate) fn thread_from_stored_thread(
         } else {
             thread.model_provider
         },
+        model: thread.model,
         created_at: thread.created_at.timestamp(),
         updated_at: thread.updated_at.timestamp(),
         recency_at: Some(thread.recency_at.timestamp()),
@@ -4552,6 +4563,7 @@ fn build_thread_from_snapshot(
         ephemeral: config_snapshot.ephemeral,
         history_mode: config_snapshot.history_mode.into(),
         model_provider: config_snapshot.model_provider_id.clone(),
+        model: Some(config_snapshot.model.clone()),
         created_at: now,
         updated_at: now,
         recency_at: Some(now),

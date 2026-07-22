@@ -7,11 +7,13 @@ use crate::agent::role::apply_role_to_config;
 use crate::agent::role::resolve_role_runtime_id;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
+use crate::tools::handlers::multi_agents::collab_tool_call_status;
 use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
 use crate::tools::handlers::multi_agents_spec::create_external_runtime_spawn_agent_tool_v2;
 use crate::tools::handlers::multi_agents_spec::create_spawn_agent_tool_v2;
 use crate::tools::handlers::multi_agents_v2::message_tool::message_content;
 use codex_protocol::AgentPath;
+use codex_protocol::protocol::CollabAgentRef;
 use codex_tools::ToolSpec;
 
 #[derive(Clone, Copy, Default)]
@@ -91,6 +93,7 @@ async fn handle_spawn_agent(
     let fork_mode = args.fork_mode(kind)?;
 
     let message = message_content(args.message)?;
+    let prompt = message.clone();
     let session_source = turn.session_source.clone();
     let child_depth = next_thread_spawn_depth(&session_source);
     let mut config =
@@ -198,17 +201,57 @@ async fn handle_spawn_agent(
         .as_ref()
         .and_then(|snapshot| snapshot.session_source.get_nickname())
         .or(spawned_agent.metadata.agent_nickname);
-    emit_sub_agent_activity(
-        &session,
-        &turn,
-        SubAgentActivityItem {
-            id: call_id,
-            agent_thread_id: new_thread_id,
-            agent_path: new_agent_path.clone(),
-            kind: SubAgentActivityKind::Started,
-        },
-    )
-    .await;
+    match kind {
+        SpawnToolKind::Reserved => {
+            emit_sub_agent_activity(
+                &session,
+                &turn,
+                SubAgentActivityItem {
+                    id: call_id,
+                    agent_thread_id: new_thread_id,
+                    agent_path: new_agent_path.clone(),
+                    kind: SubAgentActivityKind::Started,
+                },
+            )
+            .await;
+        }
+        SpawnToolKind::ExternalRuntime => {
+            let status = spawned_agent.status;
+            let model = agent_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.model.clone())
+                .unwrap_or_default();
+            let reasoning_effort = agent_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.reasoning_effort.clone())
+                .unwrap_or_default();
+            let agent_role = agent_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.session_source.get_agent_role())
+                .or_else(|| role_name.map(str::to_string));
+            session
+                .emit_turn_item_completed(
+                    &turn,
+                    TurnItem::CollabAgentToolCall(CollabAgentToolCallItem {
+                        id: call_id,
+                        tool: CollabAgentTool::SpawnAgent,
+                        status: collab_tool_call_status(&status, Some(new_thread_id)),
+                        sender_thread_id: session.thread_id,
+                        receiver_thread_ids: vec![new_thread_id],
+                        receiver_agents: vec![CollabAgentRef {
+                            thread_id: new_thread_id,
+                            agent_nickname: nickname.clone(),
+                            agent_role,
+                        }],
+                        prompt: Some(prompt),
+                        model: Some(model),
+                        reasoning_effort: Some(reasoning_effort),
+                        agents_states: [(new_thread_id, status)].into_iter().collect(),
+                    }),
+                )
+                .await;
+        }
+    }
     let role_tag = role_name.unwrap_or(DEFAULT_ROLE_NAME);
     turn.session_telemetry.counter(
         "codex.multi_agent.spawn",

@@ -30,6 +30,9 @@ ephemeral: boolean, /**
  * Model provider used for this thread (for example, 'openai').
  */
 modelProvider: string, /**
+ * Latest effective model used for this thread, when known.
+ */
+model: string | null, /**
  * Unix timestamp (in seconds) when the thread was created.
  */
 createdAt: number, /**

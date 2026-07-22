@@ -189,6 +189,8 @@ pub struct Thread {
     pub history_mode: ThreadHistoryMode,
     /// Model provider used for this thread (for example, 'openai').
     pub model_provider: String,
+    /// Latest effective model used for this thread, when known.
+    pub model: Option<String>,
     /// Unix timestamp (in seconds) when the thread was created.
     #[ts(type = "number")]
     pub created_at: i64,

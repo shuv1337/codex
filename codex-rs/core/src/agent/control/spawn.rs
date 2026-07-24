@@ -735,34 +735,22 @@ impl AgentControl {
                 truncate_rollout_to_last_n_fork_turns(&forked_rollout_items, *last_n_turns);
         }
         let multi_agent_v2_usage_hint_texts_to_filter: Vec<String> =
-            if let Some(parent_thread) = parent_thread.as_ref() {
-                if multi_agent_version == MultiAgentVersion::V2 {
-                    let parent_thread = parent_thread.as_codex_thread().ok_or_else(|| {
-                        CodexErr::UnsupportedOperation(
-                            "forking from an external agent runtime is not supported".to_string(),
-                        )
-                    })?;
-                    let parent_config = parent_thread.session.get_config().await;
-                    [
-                        parent_config
-                            .multi_agent_v2
-                            .root_agent_usage_hint_text
-                            .clone(),
-                        parent_config
-                            .multi_agent_v2
-                            .subagent_usage_hint_text
-                            .clone(),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .collect()
-                } else {
-                    Vec::new()
-                }
-            } else if multi_agent_version == MultiAgentVersion::V2 {
+            if multi_agent_version == MultiAgentVersion::V2 {
+                let parent_thread = parent_thread.as_codex_thread().ok_or_else(|| {
+                    CodexErr::UnsupportedOperation(
+                        "forking from an external agent runtime is not supported".to_string(),
+                    )
+                })?;
+                let parent_config = parent_thread.session.get_config().await;
                 [
-                    config.multi_agent_v2.root_agent_usage_hint_text.clone(),
-                    config.multi_agent_v2.subagent_usage_hint_text.clone(),
+                    parent_config
+                        .multi_agent_v2
+                        .root_agent_usage_hint_text
+                        .clone(),
+                    parent_config
+                        .multi_agent_v2
+                        .subagent_usage_hint_text
+                        .clone(),
                 ]
                 .into_iter()
                 .flatten()

@@ -233,6 +233,7 @@ impl PiRuntimeThread {
         let token_usage = TokenUsage {
             input_tokens: saturating_i64(usage.input_tokens),
             cached_input_tokens: saturating_i64(usage.cache_read_tokens),
+            cache_write_input_tokens: 0,
             output_tokens: saturating_i64(usage.output_tokens),
             reasoning_output_tokens: 0,
             total_tokens: saturating_i64(usage.total_tokens),

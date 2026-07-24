@@ -83,7 +83,7 @@ impl ExternalHostTools {
         let cancellation = self.cancellation.lock().await.child_token();
         let result = router
             .dispatch_tool_call_with_code_mode_result(
-                Arc::clone(&self.thread.codex.session),
+                Arc::clone(&self.thread.session),
                 step,
                 cancellation,
                 Arc::new(Mutex::new(TurnDiffTracker::new())),
@@ -117,23 +117,16 @@ impl ExternalHostTools {
     )> {
         let turn = self
             .thread
-            .codex
             .session
             .new_default_turn_with_sub_id(turn_id.to_string())
             .await;
+        let cancellation = self.cancellation.lock().await.child_token();
         let step = self
             .thread
-            .codex
             .session
-            .capture_step_context(Arc::clone(&turn))
-            .await;
-        let cancellation = self.cancellation.lock().await.child_token();
-        let router = crate::session::turn::built_tools(
-            self.thread.codex.session.as_ref(),
-            step.as_ref(),
-            &cancellation,
-        )
-        .await?;
+            .capture_step_context(Arc::clone(&turn), &cancellation)
+            .await?;
+        let router = Arc::clone(&step.tool_router);
         Ok((turn, step, router))
     }
 
@@ -148,7 +141,7 @@ impl ExternalHostTools {
     pub(crate) async fn reset_for_turn(&self, turn_id: &str) {
         *self.cancellation.lock().await = CancellationToken::new();
         *self.turn_id.lock().await = turn_id.to_string();
-        *self.thread.codex.session.active_turn.lock().await = Some(ActiveTurn::default());
+        *self.thread.session.active_turn.lock().await = Some(ActiveTurn::default());
     }
 
     pub(crate) async fn interrupt(&self) {

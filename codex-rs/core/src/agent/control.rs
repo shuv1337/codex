@@ -369,7 +369,6 @@ impl AgentControl {
                     agent_path: Some(agent_path.clone()),
                     agent_nickname: stored_thread.agent_nickname,
                     agent_role: stored_thread.agent_role,
-                    last_task_message: None,
                 });
                 if self.state.agent_id_for_path(&agent_path) == Some(thread_id) {
                     return Ok(thread_id);

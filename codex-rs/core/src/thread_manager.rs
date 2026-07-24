@@ -1320,6 +1320,7 @@ impl ThreadManagerState {
                     selected_capability_roots: Vec::new(),
                     multi_agent_version: Some(multi_agent_version),
                     history_mode: config_snapshot.history_mode,
+                    subagent_history_start_ordinal: None,
                     initial_window_id: thread_id.to_string(),
                     metadata: ThreadPersistenceMetadata {
                         cwd: Some(config.cwd.to_path_buf()),
@@ -1610,6 +1611,7 @@ impl ThreadManagerState {
             default_thread_environment_selections(
                 self.environment_manager.as_ref(),
                 &host_config.cwd,
+                &host_config.workspace_roots,
             )
         });
         let new_thread = self

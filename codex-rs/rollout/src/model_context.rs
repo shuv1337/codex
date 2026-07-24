@@ -152,6 +152,8 @@ impl ModelContextScan {
             RolloutItem::EventMsg(_)
             | RolloutItem::SessionMeta(_)
             | RolloutItem::InterAgentCommunicationMetadata { .. }
+            | RolloutItem::ExternalRuntimeState(_)
+            | RolloutItem::ExternalRuntimeItem(_)
             | RolloutItem::WorldState(_) => {}
         }
 

@@ -1305,6 +1305,8 @@ pub async fn read_session_meta_line(path: &Path) -> io::Result<SessionMetaLine> 
                 )));
             }
             RolloutItem::InterAgentCommunicationMetadata { .. }
+            | RolloutItem::ExternalRuntimeState(_)
+            | RolloutItem::ExternalRuntimeItem(_)
             | RolloutItem::Compacted(_)
             | RolloutItem::TurnContext(_)
             | RolloutItem::WorldState(_)

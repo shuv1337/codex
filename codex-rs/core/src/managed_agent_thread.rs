@@ -308,7 +308,7 @@ impl ManagedAgentThread {
 
     pub(crate) async fn is_turn_active(&self) -> bool {
         match self {
-            Self::Codex(thread) => thread.codex.session.active_turn.lock().await.is_some(),
+            Self::Codex(thread) => thread.session.active_turn.lock().await.is_some(),
             Self::External(thread) => matches!(*thread.status_tx.borrow(), AgentStatus::Running),
         }
     }

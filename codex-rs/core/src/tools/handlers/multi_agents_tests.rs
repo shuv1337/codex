@@ -1056,20 +1056,28 @@ async fn multi_agent_v2_spawn_uses_request_step_environments() {
         .expect("test config should allow feature update");
     set_turn_config(&mut turn, config);
     let root = manager
-        .start_thread((*turn.config).clone())
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
     session.thread_id = root.thread_id;
     let session = Arc::new(session);
     let turn = Arc::new(turn);
-    let step_context = Arc::new(StepContext::new(
-        Arc::clone(&turn),
-        step_environments,
-        Vec::new(),
-        crate::session::McpRuntimeSnapshot::new_uninitialized_for_test(&turn.config),
-        /*loaded_agents_md*/ None,
-    ));
+    let step_context = Arc::new(StepContext {
+        turn: Arc::clone(&turn),
+        environments: step_environments,
+        selected_capability_roots: Vec::new(),
+        executor_capability_discovery: None,
+        mcp: Arc::new(codex_mcp::McpBinding::empty(crate::session::tests::mcp_config_for_test(
+            &turn.config,
+        ))),
+        mcp_tools: Vec::new(),
+        tool_router: Arc::new(crate::tools::router::ToolRouter::from_parts(
+            crate::tools::registry::ToolRegistry::empty_for_test(),
+            Vec::new(),
+        )),
+        loaded_agents_md: None,
+    });
     let mut spawn_invocation = invocation(
         Arc::clone(&session),
         Arc::clone(&turn),
@@ -1130,10 +1138,10 @@ async fn multi_agent_v2_runtime_followup_sends_plaintext_without_spawning_replac
     );
     set_turn_config(&mut turn, config);
     let root = manager
-        .start_thread((*turn.config).clone())
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
-    root.thread.codex.session.new_default_turn().await;
+    root.thread.session.new_default_turn().await;
     session.services.agent_control = manager.agent_control();
     session.thread_id = root.thread_id;
     let session = Arc::new(session);
@@ -1211,10 +1219,10 @@ async fn multi_agent_v2_runtime_followup_rejects_native_target() {
         .expect("enable multi-agent v2");
     set_turn_config(&mut turn, config);
     let root = manager
-        .start_thread((*turn.config).clone())
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
-    root.thread.codex.session.new_default_turn().await;
+    root.thread.session.new_default_turn().await;
     session.services.agent_control = manager.agent_control();
     session.thread_id = root.thread_id;
     let session = Arc::new(session);

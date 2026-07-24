@@ -86,7 +86,6 @@ mod attestation;
 mod auth_mode;
 mod bespoke_event_handling;
 mod command_exec;
-mod config;
 mod config_layer;
 mod config_manager;
 mod config_manager_service;
@@ -97,6 +96,7 @@ mod dynamic_tools;
 mod effective_plugin_change;
 mod error_code;
 mod extensions;
+mod external_agent_migration;
 mod external_auth;
 #[cfg(debug_assertions)]
 mod fake_agent_runtime;
@@ -508,8 +508,11 @@ pub async fn run_main_with_transport_options(
                 .replace_thread_config_loader(Arc::clone(&discovered_thread_config_loader));
             let auth_manager =
                 AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await;
-            config_manager
-                .replace_cloud_config_bundle_loader(auth_manager, config.chatgpt_base_url);
+            config_manager.replace_cloud_config_bundle_loader(
+                auth_manager,
+                config.chatgpt_base_url.clone(),
+                config.http_client_factory(),
+            );
         }
         Err(err) => {
             warn!(error = %err, "Failed to preload config for cloud config bundle");
@@ -1195,8 +1198,16 @@ async fn init_sqlite_state_db_with_fresh_start_on_corruption(
             }
             Err(err) => err,
         };
-        let database_path = codex_state::runtime_db_path_for_corruption_error(&err)
-            .unwrap_or_else(|| codex_state::state_db_path(config.sqlite_home.as_path()));
+        let database_path =
+            codex_state::runtime_db_path_for_corruption_error(&err).unwrap_or_else(|| {
+                codex_state::SqliteConfig::from_sqlite_home(
+                    codex_utils_absolute_path::AbsolutePathBuf::resolve_path_against_base(
+                        config.sqlite_home.clone(),
+                        &config.codex_home,
+                    ),
+                )
+                .state_db_path()
+            });
         if !codex_state::is_sqlite_corruption_error(&err)
             && !sqlite_home_is_blocking_file(database_path.as_path())
         {

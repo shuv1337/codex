@@ -8,6 +8,7 @@ use codex_models_manager::bundled_models_response;
 use serde_json::Value;
 use serde_json::json;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use wiremock::Mock;
@@ -26,7 +27,7 @@ const DISCOVERABLE_CALENDAR_ID: &str = "connector_2128aebfecb84f64a069897515042a
 const DISCOVERABLE_GMAIL_ID: &str = "connector_68df038e0ba48191908c8434991bbac2";
 const CONNECTOR_DESCRIPTION: &str = "Plan events and manage your calendar.";
 const CODEX_APPS_META_KEY: &str = "_codex_apps";
-const CODEX_APPS_MCP_PATH_REGEX: &str = "^/api/codex/apps/?$";
+const CODEX_APPS_MCP_PATH_REGEX: &str = "^/api/codex/ps/mcp/?$";
 const HOSTED_PLUGIN_RUNTIME_MCP_PATH_REGEX: &str = "^/api/codex/ps/mcp/?$";
 const PROTOCOL_VERSION: &str = "2025-11-25";
 const SERVER_NAME: &str = "codex-apps-test";
@@ -81,10 +82,10 @@ pub enum AppsTestToolLoading {
     Searchable,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum AppsTestToolsListBehavior {
     AlwaysAvailable,
-    AvailableAfterInitialList,
+    AvailableWhen(Arc<AtomicBool>),
     AlwaysUnavailable,
 }
 
@@ -197,12 +198,13 @@ impl AppsTestServer {
         ))
     }
 
-    pub async fn mount_with_tools_available_after_initial_list(
+    pub async fn mount_with_tools_available_when(
         server: &MockServer,
+        tools_available: Arc<AtomicBool>,
     ) -> Result<Self> {
         Self::mount_with_tools_list_behavior(
             server,
-            AppsTestToolsListBehavior::AvailableAfterInitialList,
+            AppsTestToolsListBehavior::AvailableWhen(tools_available),
         )
         .await
     }
@@ -288,7 +290,7 @@ pub async fn recorded_apps_tool_calls(server: &MockServer) -> Vec<Value> {
         .into_iter()
         .filter_map(|request| {
             let body: Value = serde_json::from_slice(&request.body).ok()?;
-            (request.url.path() == "/api/codex/apps"
+            (request.url.path() == "/api/codex/ps/mcp"
                 && body.get("method").and_then(Value::as_str) == Some("tools/call"))
             .then_some(body)
         })
@@ -435,7 +437,6 @@ async fn mount_streamable_http_json_rpc_with_startup_control(
             searchable,
             include_app_only_tool,
             tools_list_behavior,
-            tools_list_calls: AtomicUsize::new(0),
             initialize_attempts,
             remaining_initialize_failures,
         })
@@ -449,7 +450,6 @@ struct CodexAppsJsonRpcResponder {
     searchable: bool,
     include_app_only_tool: bool,
     tools_list_behavior: AppsTestToolsListBehavior,
-    tools_list_calls: AtomicUsize,
     initialize_attempts: Option<Arc<AtomicUsize>>,
     remaining_initialize_failures: Option<Arc<AtomicUsize>>,
 }
@@ -515,10 +515,11 @@ impl Respond for CodexAppsJsonRpcResponder {
             }
             "notifications/initialized" => ResponseTemplate::new(202),
             "tools/list" => {
-                let list_index = self.tools_list_calls.fetch_add(1, Ordering::SeqCst);
-                let tools_available = match self.tools_list_behavior {
+                let tools_available = match &self.tools_list_behavior {
                     AppsTestToolsListBehavior::AlwaysAvailable => true,
-                    AppsTestToolsListBehavior::AvailableAfterInitialList => list_index > 0,
+                    AppsTestToolsListBehavior::AvailableWhen(tools_available) => {
+                        tools_available.load(Ordering::SeqCst)
+                    }
                     AppsTestToolsListBehavior::AlwaysUnavailable => false,
                 };
                 let id = body.get("id").cloned().unwrap_or(Value::Null);

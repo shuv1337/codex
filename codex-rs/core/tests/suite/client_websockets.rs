@@ -161,8 +161,7 @@ async fn responses_websocket_streams_request() {
 
     let harness = websocket_harness(&server).await;
     let mut client_session = harness.client.new_session();
-    let mut prompt = prompt_with_input(vec![message_item("hello")]);
-    prompt.input[0].set_id(Some(ResponseItemId::with_suffix("msg", "existing")));
+    let prompt = prompt_with_input(vec![message_item("hello")]);
 
     stream_until_complete(&mut client_session, &harness, &prompt).await;
 
@@ -174,7 +173,6 @@ async fn responses_websocket_streams_request() {
     assert_eq!(body["model"].as_str(), Some(MODEL));
     assert_eq!(body["stream"], serde_json::Value::Bool(true));
     assert_eq!(body["input"].as_array().map(Vec::len), Some(1));
-    assert_eq!(body["input"][0].get("id"), None);
     let handshake = server.single_handshake();
     assert_eq!(
         handshake.header(OPENAI_BETA_HEADER),
@@ -225,7 +223,7 @@ async fn responses_websocket_omits_unprefixed_item_ids_without_mutating_prompt()
         websocket_provider(&server),
         /*runtime_metrics_enabled*/ false,
         /*concurrent_reasoning_summaries_enabled*/ false,
-        /*enabled_features*/ &[Feature::ItemIds],
+        /*enabled_features*/ &[],
     )
     .await;
     let mut client_session = harness.client.new_session();
@@ -1483,7 +1481,11 @@ async fn responses_websocket_usage_limit_error_emits_rate_limit_event() {
             "x-codex-secondary-used-percent": "87.5",
             "x-codex-primary-over-secondary-limit-percent": "95.0",
             "x-codex-primary-window-minutes": "15",
-            "x-codex-secondary-window-minutes": "60"
+            "x-codex-secondary-window-minutes": "60",
+            "x-codex-credits-has-credits": "true",
+            "x-codex-credits-unlimited": "false",
+            "x-codex-credits-balance": "",
+            "x-codex-rate-limit-reached-type": "workspace_member_usage_limit_reached"
         }
     });
 
@@ -1543,10 +1545,15 @@ async fn responses_websocket_usage_limit_error_emits_rate_limit_event() {
                     "window_minutes": 60,
                     "resets_at": null
                 },
-                "credits": null,
+                "credits": {
+                    "has_credits": true,
+                    "unlimited": false,
+                    "balance": null
+                },
                 "individual_limit": null,
+                "spend_control_reached": null,
                 "plan_type": null,
-                "rate_limit_reached_type": null
+                "rate_limit_reached_type": "workspace_member_usage_limit_reached"
             }
         })
     );
@@ -1556,7 +1563,7 @@ async fn responses_websocket_usage_limit_error_emits_rate_limit_event() {
         unreachable!();
     };
     assert!(
-        error_event.message.to_lowercase().contains("usage limit"),
+        error_event.message.contains("spend cap set by the owner"),
         "unexpected error message for submission {submission_id}: {}",
         error_event.message
     );
@@ -2278,6 +2285,7 @@ fn websocket_provider_with_connect_timeout(
         websocket_connect_timeout_ms,
         requires_openai_auth: false,
         supports_websockets: true,
+        supports_standalone_web_search: false,
     }
 }
 
@@ -2380,7 +2388,6 @@ async fn websocket_harness_with_provider_options(
         /*enable_request_compression*/ false,
         runtime_metrics_enabled,
         /*beta_features_header*/ None,
-        /*item_ids_enabled*/ config.features.enabled(Feature::ItemIds),
         /*concurrent_reasoning_summaries_enabled*/
         config
             .features

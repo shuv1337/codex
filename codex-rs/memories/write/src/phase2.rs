@@ -326,7 +326,6 @@ mod agent {
         // Approval policy
         agent_config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
         // Consolidation runs as an internal worker and must not recursively delegate.
-        let _ = agent_config.features.disable(Feature::SpawnCsv);
         let _ = agent_config.features.disable(Feature::Collab);
         let _ = agent_config.features.disable(Feature::MemoryTool);
         let _ = agent_config.features.disable(Feature::Apps);
@@ -606,6 +605,11 @@ fn emit_token_usage_metrics(context: &MemoryStartupContext, token_usage: &TokenU
         MEMORY_PHASE_TWO_TOKEN_USAGE,
         token_usage.cached_input(),
         &[("token_type", "cached_input")],
+    );
+    context.histogram(
+        MEMORY_PHASE_TWO_TOKEN_USAGE,
+        token_usage.cache_write_input_tokens.max(0),
+        &[("token_type", "cache_write_input")],
     );
     context.histogram(
         MEMORY_PHASE_TWO_TOKEN_USAGE,

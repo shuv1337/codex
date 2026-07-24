@@ -227,15 +227,8 @@ async fn is_unloadable(thread: &ManagedAgentThread) -> bool {
         thread.agent_status().await,
         AgentStatus::Completed(_) | AgentStatus::Errored(_) | AgentStatus::Interrupted
     ) && if let Some(codex_thread) = thread.as_codex_thread() {
-        codex_thread
-            .codex
-            .session
-            .active_turn
-            .lock()
-            .await
-            .is_none()
+        codex_thread.session.active_turn.lock().await.is_none()
             && !codex_thread
-                .codex
                 .session
                 .input_queue
                 .has_pending_mailbox_items()

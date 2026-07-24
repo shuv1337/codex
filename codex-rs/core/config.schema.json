@@ -40,26 +40,35 @@
         "$ref": "#/definitions/AgentRoleToml"
       },
       "properties": {
+        "default_subagent_model": {
+          "description": "Default model for spawned subagents when the spawn call does not select one.",
+          "type": "string"
+        },
+        "default_subagent_reasoning_effort": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ReasoningEffort"
+            }
+          ],
+          "description": "Default reasoning effort for spawned subagents when the spawn call does not select one."
+        },
+        "enabled": {
+          "description": "Whether multi-agent tools are enabled. Defaults to true. An enabled `features.multi_agent_v2` setting takes precedence.",
+          "type": "boolean"
+        },
         "interrupt_message": {
           "description": "Whether to record a model-visible message when an agent turn is interrupted. Defaults to true.",
           "type": "boolean"
         },
-        "job_max_runtime_seconds": {
-          "description": "Default maximum runtime in seconds for agent job workers.",
-          "format": "uint64",
+        "max_concurrent_threads_per_session": {
+          "description": "Maximum number of spawned agent threads that can be open concurrently per session. When unset, the selected multi-agent backend uses its default.",
+          "format": "uint",
           "minimum": 1.0,
           "type": "integer"
         },
         "max_depth": {
-          "description": "Maximum nesting depth allowed for spawned agent threads. Root sessions start at depth 0.",
+          "description": "Maximum nesting depth for V1 agent threads. Ignored by V2.",
           "format": "int32",
-          "minimum": 1.0,
-          "type": "integer"
-        },
-        "max_threads": {
-          "description": "Maximum number of agent threads that can be open concurrently. When unset, no limit is enforced.",
-          "format": "uint",
-          "minimum": 1.0,
           "type": "integer"
         }
       },
@@ -453,6 +462,9 @@
             "code_mode": {
               "$ref": "#/definitions/FeatureToml_for_CodeModeConfigToml"
             },
+            "code_mode_buffered_exec": {
+              "type": "boolean"
+            },
             "code_mode_host": {
               "type": "boolean"
             },
@@ -507,10 +519,16 @@
             "exec_permission_approvals": {
               "type": "boolean"
             },
+            "executor_capability_discovery": {
+              "type": "boolean"
+            },
             "experimental_use_unified_exec_tool": {
               "type": "boolean"
             },
             "experimental_windows_sandbox": {
+              "type": "boolean"
+            },
+            "external_agent_memory_import": {
               "type": "boolean"
             },
             "external_migration": {
@@ -552,6 +570,9 @@
             "local_thread_store_compression": {
               "type": "boolean"
             },
+            "mcp_2026_07_28": {
+              "type": "boolean"
+            },
             "memories": {
               "type": "boolean"
             },
@@ -574,7 +595,7 @@
               "$ref": "#/definitions/FeatureToml_for_NetworkProxyConfigToml"
             },
             "non_prefixed_mcp_tool_names": {
-              "type": "boolean"
+              "$ref": "#/definitions/FeatureToml_for_NonPrefixedMcpToolNamesConfigToml"
             },
             "personality": {
               "type": "boolean"
@@ -652,6 +673,9 @@
               "type": "boolean"
             },
             "skill_mcp_dependency_install": {
+              "type": "boolean"
+            },
+            "skill_search": {
               "type": "boolean"
             },
             "sqlite": {
@@ -987,6 +1011,16 @@
         }
       ]
     },
+    "FeatureToml_for_NonPrefixedMcpToolNamesConfigToml": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "$ref": "#/definitions/NonPrefixedMcpToolNamesConfigToml"
+        }
+      ]
+    },
     "FeatureToml_for_RolloutBudgetConfigToml": {
       "anyOf": [
         {
@@ -1178,6 +1212,12 @@
       "oneOf": [
         {
           "properties": {
+            "additionalContextLimit": {
+              "description": "Approximate token threshold for spilling this hook's `additionalContext` to disk. Unset uses 2,500 tokens; `0` disables spilling for this hook. The threshold is evaluated against the original context; a spilled preview also includes recovery metadata.",
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            },
             "async": {
               "default": false,
               "type": "boolean"
@@ -1284,6 +1324,13 @@
           "type": "array"
         },
         "PreToolUse": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/MatcherGroup"
+          },
+          "type": "array"
+        },
+        "SessionEnd": {
           "default": [],
           "items": {
             "$ref": "#/definitions/MatcherGroup"
@@ -1703,6 +1750,11 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "supports_standalone_web_search": {
+          "default": false,
+          "description": "Whether this provider supports the standalone web-search endpoint.",
+          "type": "boolean"
+        },
         "supports_websockets": {
           "default": false,
           "description": "Whether this provider supports the Responses API WebSocket transport.",
@@ -1736,6 +1788,10 @@
           "type": "integer"
         },
         "enabled": {
+          "type": "boolean"
+        },
+        "expose_spawn_agent_model_overrides": {
+          "description": "Exposes `model` and `reasoning_effort` on the multi-agent v2 spawn tool and adds corresponding guidance to root and subagent usage hints.",
           "type": "boolean"
         },
         "hide_spawn_agent_metadata": {
@@ -1782,6 +1838,10 @@
         },
         "usage_hint_text": {
           "type": "string"
+        },
+        "wait_agent_enabled": {
+          "description": "Expose the multi-agent v2 `wait_agent` tool.",
+          "type": "boolean"
         }
       },
       "type": "object"
@@ -2037,6 +2097,22 @@
       "type": "string"
     },
     "NetworkUnixSocketPermissionsToml": {
+      "type": "object"
+    },
+    "NonPrefixedMcpToolNamesConfigToml": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "server_names": {
+          "description": "MCP servers whose tools should omit the legacy `mcp__` namespace prefix.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
       "type": "object"
     },
     "Notice": {
@@ -2637,7 +2713,8 @@
     "RealtimeConversationVersion": {
       "enum": [
         "v1",
-        "v2"
+        "v2",
+        "v3"
       ],
       "type": "string"
     },
@@ -2722,6 +2799,25 @@
         }
       ]
     },
+    "ResumeCwdMode": {
+      "description": "Working directory to use when resuming or forking a session.",
+      "oneOf": [
+        {
+          "description": "Use the directory where Codex was launched.",
+          "enum": [
+            "current"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Use the latest working directory recorded in the selected session.",
+          "enum": [
+            "session"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "RolloutBudgetConfigToml": {
       "additionalProperties": false,
       "properties": {
@@ -2795,6 +2891,14 @@
       ],
       "type": "string"
     },
+    "ShellEnvironmentPolicyFilter": {
+      "description": "Assigns a shell environment variable pattern to the include-only or exclude set. Includes do not re-add variables removed by another exclude pattern.",
+      "enum": [
+        "include",
+        "exclude"
+      ],
+      "type": "string"
+    },
     "ShellEnvironmentPolicyInherit": {
       "oneOf": [
         {
@@ -2822,10 +2926,28 @@
     },
     "ShellEnvironmentPolicyToml": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "not": {
+            "required": [
+              "exclude",
+              "filters"
+            ]
+          }
+        },
+        {
+          "not": {
+            "required": [
+              "filters",
+              "include_only"
+            ]
+          }
+        }
+      ],
       "description": "Policy for building the `env` when spawning a process via shell-like tools.",
       "properties": {
         "exclude": {
-          "description": "List of regular expressions.",
+          "description": "Legacy list of regular expressions to exclude.",
           "items": {
             "type": "string"
           },
@@ -2834,11 +2956,18 @@
         "experimental_use_profile": {
           "type": "boolean"
         },
+        "filters": {
+          "additionalProperties": {
+            "$ref": "#/definitions/ShellEnvironmentPolicyFilter"
+          },
+          "description": "Pattern actions used by the canonical table representation.\n\nOrdinary config keeps accepting the legacy arrays above during the migration. Requirements will accept only this keyed form, keeping array compatibility isolated so the legacy fields can be deprecated later. Pattern keys merge case-insensitively across config layers, matching how the resulting patterns match environment variable names.",
+          "type": "object"
+        },
         "ignore_default_excludes": {
           "type": "boolean"
         },
         "include_only": {
-          "description": "List of regular expressions.",
+          "description": "Legacy list of regular expressions to include.",
           "items": {
             "type": "string"
           },
@@ -2920,6 +3049,17 @@
     "TokenBudgetConfigToml": {
       "additionalProperties": false,
       "properties": {
+        "auto_compact_fallback_buffer_tokens": {
+          "description": "Additional tokens available after the compaction threshold for fallback note-taking.",
+          "format": "int64",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "auto_compact_fallback_prompt": {
+          "description": "Developer message sampled before an automatic context-window rollover.",
+          "maxLength": 2000,
+          "type": "string"
+        },
         "enabled": {
           "type": "boolean"
         },
@@ -3241,6 +3381,15 @@
           "default": false,
           "description": "Start the TUI in raw scrollback mode for copy-friendly transcript output. Defaults to `false`.",
           "type": "boolean"
+        },
+        "resume_cwd": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ResumeCwdMode"
+            }
+          ],
+          "default": null,
+          "description": "Working directory to use when resuming or forking a session. When unset, prompt if the current and session directories differ."
         },
         "session_picker_view": {
           "allOf": [
@@ -4619,7 +4768,6 @@
       "description": "Agent-related settings (thread limits, etc.)."
     },
     "allow_login_shell": {
-      "default": true,
       "description": "Whether the model may request a login shell for shell-based tools. Default to `true`\n\nIf `true`, the model may request a login shell (`login = true`), and omitting `login` defaults to using a login shell. If `false`, the model can never use a login shell: `login = true` requests are rejected, and omitting `login` defaults to a non-login shell.",
       "type": "boolean"
     },
@@ -4825,6 +4973,9 @@
         "code_mode": {
           "$ref": "#/definitions/FeatureToml_for_CodeModeConfigToml"
         },
+        "code_mode_buffered_exec": {
+          "type": "boolean"
+        },
         "code_mode_host": {
           "type": "boolean"
         },
@@ -4879,10 +5030,16 @@
         "exec_permission_approvals": {
           "type": "boolean"
         },
+        "executor_capability_discovery": {
+          "type": "boolean"
+        },
         "experimental_use_unified_exec_tool": {
           "type": "boolean"
         },
         "experimental_windows_sandbox": {
+          "type": "boolean"
+        },
+        "external_agent_memory_import": {
           "type": "boolean"
         },
         "external_migration": {
@@ -4924,6 +5081,9 @@
         "local_thread_store_compression": {
           "type": "boolean"
         },
+        "mcp_2026_07_28": {
+          "type": "boolean"
+        },
         "memories": {
           "type": "boolean"
         },
@@ -4946,7 +5106,7 @@
           "$ref": "#/definitions/FeatureToml_for_NetworkProxyConfigToml"
         },
         "non_prefixed_mcp_tool_names": {
-          "type": "boolean"
+          "$ref": "#/definitions/FeatureToml_for_NonPrefixedMcpToolNamesConfigToml"
         },
         "personality": {
           "type": "boolean"
@@ -5024,6 +5184,9 @@
           "type": "boolean"
         },
         "skill_mcp_dependency_install": {
+          "type": "boolean"
+        },
+        "skill_search": {
           "type": "boolean"
         },
         "sqlite": {
@@ -5455,6 +5618,7 @@
       "default": {
         "exclude": null,
         "experimental_use_profile": null,
+        "filters": null,
         "ignore_default_excludes": null,
         "include_only": null,
         "inherit": null,

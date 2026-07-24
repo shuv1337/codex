@@ -17,17 +17,21 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::env;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
-use async_channel::unbounded;
+use codex_config::ConfigLayerStack;
 use codex_config::Constrained;
 use codex_config::McpServerAuth;
 use codex_config::McpServerConfig;
 use codex_config::McpServerTransportConfig;
 use codex_config::types::AppToolApproval;
+use codex_config::types::ApprovalsReviewer;
 use codex_config::types::AuthKeyringBackendKind;
 use codex_config::types::OAuthCredentialsStoreMode;
+use codex_connectors::ConnectorRuntimeManager;
 use codex_connectors::ConnectorSnapshot;
+use codex_connectors::connector_runtime_context_key;
 use codex_login::CodexAuth;
 use codex_model_provider::CHATGPT_CODEX_BASE_URL;
 use codex_protocol::mcp::McpServerInfo;
@@ -37,6 +41,7 @@ use codex_protocol::mcp::Tool;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::McpAuthStatus;
+use codex_utils_path_uri::PathUri;
 use rmcp::model::ElicitationCapability;
 use rmcp::model::ReadResourceRequestParams;
 use rmcp::model::ReadResourceResult;
@@ -44,11 +49,12 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::ResolvedMcpCatalog;
-use crate::codex_apps_cache::CodexAppsToolsCache;
-use crate::codex_apps_cache::codex_apps_tools_cache_key;
-use crate::connection_manager::McpConnectionManager;
+use crate::connection_manager::McpConnectionSet;
+use crate::runtime::McpPublicationGate;
 use crate::runtime::McpRuntimeContext;
+use crate::runtime::McpRuntimeInput;
 use crate::server::EffectiveMcpServer;
+use crate::tools::ToolInfo;
 
 pub const CODEX_APPS_MCP_SERVER_NAME: &str = "codex_apps";
 const DEFAULT_CODEX_APPS_MCP_PRODUCT_SKU: &str = "codex";
@@ -105,13 +111,10 @@ pub struct McpPermissionPromptAutoApproveContext {
 
 /// MCP runtime settings derived from `codex_core::config::Config`.
 ///
-/// This struct should contain only long-lived configuration values that the
-/// `codex-mcp` crate needs to construct server transports, enforce MCP
-/// approval/sandbox policy, locate OAuth state, and merge plugin-provided MCP
-/// servers. Request-scoped or auth-scoped state should not be stored here;
-/// thread those values explicitly into runtime entry points such as
-/// [`effective_mcp_servers`] and snapshot collection helpers so config objects
-/// do not go stale when auth changes.
+/// Each published runtime and prepared call owns one immutable copy of these
+/// settings, so its connection, approval policy, and sandbox authority cannot
+/// change independently. Auth remains separate and is supplied explicitly to
+/// runtime entry points such as [`effective_mcp_servers`].
 #[derive(Debug, Clone)]
 pub struct McpConfig {
     /// Base URL for ChatGPT-hosted app MCP servers, copied from the root config.
@@ -132,6 +135,14 @@ pub struct McpConfig {
     pub skill_mcp_dependency_install_enabled: bool,
     /// Approval policy used for MCP tool calls and MCP elicitation requests.
     pub approval_policy: Constrained<AskForApproval>,
+    /// Permission profile captured with the connections and approval policy.
+    pub permission_profile: PermissionProfile,
+    /// Configuration layers used to evaluate Apps tool policy and reviewer selection.
+    pub config_layer_stack: ConfigLayerStack,
+    /// Default reviewer used when an Apps tool has no reviewer override.
+    pub approvals_reviewer: ApprovalsReviewer,
+    /// Working directories for the exact environment handles used by this runtime.
+    pub environment_cwds: HashMap<String, PathUri>,
     /// Optional path to `codex-linux-sandbox` for sandboxed MCP tool execution.
     pub codex_linux_sandbox_exe: Option<PathBuf>,
     /// Whether to use legacy Landlock behavior in the MCP sandbox state.
@@ -144,6 +155,8 @@ pub struct McpConfig {
     /// Whether model-visible MCP tool namespaces should keep the legacy
     /// `mcp__` prefix.
     pub prefix_mcp_tool_names: bool,
+    /// MCP servers whose model-visible tool namespaces omit the `mcp__` prefix.
+    pub non_prefixed_mcp_tool_servers: Vec<String>,
     /// Client-side elicitation capabilities advertised during MCP initialization.
     pub client_elicitation_capability: ElicitationCapability,
     /// Resolved MCP registrations keyed by logical server name.
@@ -303,45 +316,37 @@ pub async fn read_mcp_resource(
     config: &McpConfig,
     auth: Option<&CodexAuth>,
     runtime_context: McpRuntimeContext,
-    codex_apps_tools_cache: CodexAppsToolsCache,
+    codex_apps_tools_cache: ConnectorRuntimeManager<ToolInfo>,
+    tool_catalog_cache: crate::McpToolCatalogCache,
     server: &str,
     uri: &str,
 ) -> anyhow::Result<ReadResourceResult> {
     let mut mcp_servers = effective_mcp_servers(config, auth);
     mcp_servers.retain(|name, _| name == server);
-    let auth_statuses = compute_auth_statuses(
-        mcp_servers.iter(),
-        config.mcp_oauth_credentials_store_mode,
-        config.auth_keyring_backend_kind,
-        auth,
-        &runtime_context,
-    )
-    .await;
-    let (tx_event, rx_event) = unbounded();
-    drop(rx_event);
     let cancel_token = CancellationToken::new();
-    let manager = McpConnectionManager::new(
-        &mcp_servers,
-        config.mcp_oauth_credentials_store_mode,
-        config.auth_keyring_backend_kind,
-        auth_statuses,
-        &config.approval_policy,
-        String::new(),
-        tx_event,
-        cancel_token.clone(),
-        PermissionProfile::default(),
-        runtime_context,
-        config.codex_home.clone(),
-        codex_apps_tools_cache,
-        codex_apps_tools_cache_key(auth),
-        config.prefix_mcp_tool_names,
-        config.client_elicitation_capability.clone(),
-        /*supports_openai_form_elicitation*/ false,
-        tool_plugin_provenance(config),
-        auth,
-        /*codex_apps_auth_manager*/ None,
-        /*elicitation_reviewer*/ None,
-        /*elicitation_lifecycle*/ None,
+    let mut runtime_config = config.clone();
+    runtime_config.permission_profile = PermissionProfile::default();
+    let manager = McpConnectionSet::new(
+        /*previous*/ None,
+        McpPublicationGate::already_published(),
+        McpRuntimeInput {
+            config: Arc::new(runtime_config),
+            plugins_available: false,
+            ready_selected_capability_roots: Vec::new(),
+            mcp_servers,
+            submit_id: String::new(),
+            tx_event: None,
+            startup_cancellation_token: cancel_token.clone(),
+            runtime_context,
+            codex_apps_tools_cache,
+            tool_catalog_cache,
+            codex_apps_tools_cache_key: connector_runtime_context_key(auth),
+            supports_openai_form_elicitation: false,
+            auth: auth.cloned(),
+            codex_apps_auth_manager: None,
+            elicitation_reviewer: None,
+            elicitation_lifecycle: None,
+        },
         crate::elicitation::ElicitationRequestRouter::default(),
     )
     .await;
@@ -368,11 +373,11 @@ pub async fn collect_mcp_server_status_snapshot_with_detail(
     auth: Option<&CodexAuth>,
     submit_id: String,
     runtime_context: McpRuntimeContext,
-    codex_apps_tools_cache: CodexAppsToolsCache,
+    codex_apps_tools_cache: ConnectorRuntimeManager<ToolInfo>,
+    tool_catalog_cache: crate::McpToolCatalogCache,
     detail: McpSnapshotDetail,
 ) -> McpServerStatusSnapshot {
     let mcp_servers = effective_mcp_servers(config, auth);
-    let tool_plugin_provenance = tool_plugin_provenance(config);
     if mcp_servers.is_empty() {
         return McpServerStatusSnapshot {
             server_infos: HashMap::new(),
@@ -395,32 +400,30 @@ pub async fn collect_mcp_server_status_snapshot_with_detail(
 
     let server_names = mcp_servers.keys().cloned().collect();
 
-    let (tx_event, rx_event) = unbounded();
-    drop(rx_event);
-
     let cancel_token = CancellationToken::new();
-    let mcp_connection_manager = McpConnectionManager::new(
-        &mcp_servers,
-        config.mcp_oauth_credentials_store_mode,
-        config.auth_keyring_backend_kind,
-        auth_status_entries.clone(),
-        &config.approval_policy,
-        submit_id,
-        tx_event,
-        cancel_token.clone(),
-        PermissionProfile::default(),
-        runtime_context,
-        config.codex_home.clone(),
-        codex_apps_tools_cache,
-        codex_apps_tools_cache_key(auth),
-        config.prefix_mcp_tool_names,
-        config.client_elicitation_capability.clone(),
-        /*supports_openai_form_elicitation*/ false,
-        tool_plugin_provenance,
-        auth,
-        /*codex_apps_auth_manager*/ None,
-        /*elicitation_reviewer*/ None,
-        /*elicitation_lifecycle*/ None,
+    let mut runtime_config = config.clone();
+    runtime_config.permission_profile = PermissionProfile::default();
+    let mcp_connection_manager = McpConnectionSet::new(
+        /*previous*/ None,
+        McpPublicationGate::already_published(),
+        McpRuntimeInput {
+            config: Arc::new(runtime_config),
+            plugins_available: false,
+            ready_selected_capability_roots: Vec::new(),
+            mcp_servers,
+            submit_id,
+            tx_event: None,
+            startup_cancellation_token: cancel_token.clone(),
+            runtime_context,
+            codex_apps_tools_cache,
+            tool_catalog_cache,
+            codex_apps_tools_cache_key: connector_runtime_context_key(auth),
+            supports_openai_form_elicitation: false,
+            auth: auth.cloned(),
+            codex_apps_auth_manager: None,
+            elicitation_reviewer: None,
+            elicitation_lifecycle: None,
+        },
         crate::elicitation::ElicitationRequestRouter::default(),
     )
     .await;
@@ -480,14 +483,12 @@ fn normalize_codex_apps_base_url(base_url: &str) -> String {
 
 fn codex_apps_mcp_url_for_base_url(base_url: &str) -> String {
     let base_url = normalize_codex_apps_base_url(base_url);
-    let (base_url, default_path) = if base_url.contains("/backend-api") {
-        (base_url, "wham/apps")
-    } else if base_url.contains("/api/codex") {
-        (base_url, "apps")
+    let base_url = if base_url.contains("/backend-api") || base_url.contains("/api/codex") {
+        base_url
     } else {
-        (format!("{base_url}/api/codex"), "apps")
+        format!("{base_url}/api/codex")
     };
-    format!("{base_url}/{default_path}")
+    format!("{base_url}/ps/mcp")
 }
 
 pub fn codex_apps_mcp_server_config(
@@ -509,18 +510,7 @@ pub fn hosted_plugin_runtime_mcp_server_config(
     apps_mcp_product_sku: Option<&str>,
     originator: Option<&str>,
 ) -> McpServerConfig {
-    let base_url = normalize_codex_apps_base_url(chatgpt_base_url);
-    let base_url = if base_url.contains("/backend-api") || base_url.contains("/api/codex") {
-        base_url
-    } else {
-        format!("{base_url}/api/codex")
-    };
-    mcp_server_config_for_url(
-        format!("{base_url}/ps/mcp"),
-        apps_mcp_product_sku,
-        originator,
-        McpServerAuth::ChatGpt,
-    )
+    codex_apps_mcp_server_config(chatgpt_base_url, apps_mcp_product_sku, originator)
 }
 
 fn mcp_server_config_for_url(
@@ -666,13 +656,17 @@ fn convert_mcp_resource_templates(
 }
 
 async fn collect_mcp_server_status_snapshot_from_manager(
-    mcp_connection_manager: &McpConnectionManager,
+    mcp_connection_manager: &McpConnectionSet,
     auth_status_entries: HashMap<String, crate::mcp::auth::McpAuthStatusEntry>,
     server_names: Vec<String>,
     detail: McpSnapshotDetail,
 ) -> McpServerStatusSnapshot {
-    let (tools, resources, resource_templates) = tokio::join!(
-        mcp_connection_manager.list_all_tools(),
+    let ((server_infos, tools), resources, resource_templates) = tokio::join!(
+        async {
+            let server_infos = mcp_connection_manager.list_available_server_infos().await;
+            let tools = mcp_connection_manager.list_all_tools().await;
+            (server_infos, tools)
+        },
         async {
             if detail.include_resources() {
                 mcp_connection_manager.list_all_resources(|_| true).await
@@ -690,7 +684,6 @@ async fn collect_mcp_server_status_snapshot_from_manager(
             }
         },
     );
-    let server_infos = mcp_connection_manager.list_available_server_infos().await;
 
     let mut tools_by_server = HashMap::<String, HashMap<String, Tool>>::new();
     for tool_info in tools {
@@ -717,4 +710,4 @@ async fn collect_mcp_server_status_snapshot_from_manager(
 
 #[cfg(test)]
 #[path = "mod_tests.rs"]
-mod tests;
+pub(crate) mod tests;

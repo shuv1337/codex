@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use codex_core_skills::HostSkillsSnapshot;
+use codex_core_skills::injection::HostSkillsCatalogInWorldState;
 use codex_core_skills::injection::InjectedHostSkillPrompts;
 use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 use codex_extension_api::ConfigContributor;
@@ -11,6 +12,9 @@ use codex_extension_api::ExtensionEventSink;
 use codex_extension_api::ExtensionFuture;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::PromptFragment;
+use codex_extension_api::SkillInvocationContributor;
+use codex_extension_api::SkillInvocationInput;
+use codex_extension_api::SkillInvocationKind;
 use codex_extension_api::ThreadLifecycleContributor;
 use codex_extension_api::ThreadStartInput;
 use codex_extension_api::ToolCall;
@@ -21,6 +25,7 @@ use codex_extension_api::TurnInputContributor;
 use codex_extension_api::WorldStateContributionInput;
 use codex_extension_api::WorldStateSectionContribution;
 use codex_mcp::McpResourceClient;
+use codex_otel::MetricsClient;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
@@ -37,21 +42,27 @@ use crate::provider::SkillListQuery;
 use crate::provider::SkillReadRequest;
 use crate::render::MAX_SKILL_NAME_BYTES;
 use crate::render::MAX_SKILL_PATH_BYTES;
+use crate::render::SkillCatalogRenderPolicy;
 use crate::render::available_skills_fragment;
+use crate::render::capped_skill_metadata_budget;
 use crate::render::truncate_main_prompt_contents;
 use crate::render::truncate_utf8_to_bytes;
 use crate::selection::collect_explicit_skill_mentions;
+use crate::shadow_selection_experiment::ShadowSelectionExperiment;
 use crate::sources::SkillProviders;
 use crate::state::ExecutorSkillsStepState;
+use crate::state::SkillsSessionState;
 use crate::state::SkillsThreadState;
 use crate::state::SkillsTurnState;
 use crate::tools::skill_tools;
 use crate::world_state::executor_skills_world_state_section;
+use crate::world_state::host_skills_world_state_section;
 
 struct SkillsExtension<C> {
     providers: SkillProviders,
     event_sink: Arc<dyn ExtensionEventSink>,
     config_from_host: Arc<dyn Fn(&C) -> SkillsExtensionConfig + Send + Sync>,
+    shadow_selection: Arc<ShadowSelectionExperiment>,
 }
 
 impl<C> ThreadLifecycleContributor<C> for SkillsExtension<C>
@@ -60,6 +71,9 @@ where
 {
     fn on_thread_start<'a>(&'a self, input: ThreadStartInput<'a, C>) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
+            input.session_store.insert(SkillsSessionState {
+                mcp_resources: input.mcp_resource_client.clone(),
+            });
             let orchestrator_skills_available = !input
                 .environments
                 .iter()
@@ -122,7 +136,10 @@ where
                         include_host_skills: false,
                         include_bundled_skills: config.bundled_skills_enabled,
                         include_orchestrator_skills: thread_state.orchestrator_skills_enabled(),
-                        mcp_resources: session_store.get::<McpResourceClient>(),
+                        mcp_resources: session_store
+                            .get::<SkillsSessionState>()
+                            .and_then(|state| state.mcp_resources.clone()),
+                        executor_capability_discovery: None,
                     },
                     &thread_state,
                 )
@@ -133,10 +150,15 @@ where
             let include_usage = thread_store
                 .get::<ModelInfo>()
                 .is_some_and(|model_info| model_info.include_skills_usage_instructions);
-            available_skills_fragment(&catalog, include_usage)
-                .map(|fragment| PromptFragment::developer_capability(fragment.render()))
-                .into_iter()
-                .collect()
+            available_skills_fragment(
+                &catalog,
+                include_usage,
+                SkillCatalogRenderPolicy::ExtensionCompatible,
+                capped_skill_metadata_budget(/*context_window*/ None),
+            )
+            .map(|fragment| PromptFragment::developer_capability(fragment.render()))
+            .into_iter()
+            .collect()
         })
     }
 
@@ -159,22 +181,43 @@ where
                         include_host_skills: false,
                         include_bundled_skills: config.bundled_skills_enabled,
                         include_orchestrator_skills: false,
-                        mcp_resources: input.session_store.get::<McpResourceClient>(),
+                        mcp_resources: input
+                            .session_store
+                            .get::<SkillsSessionState>()
+                            .and_then(|state| state.mcp_resources.clone()),
+                        executor_capability_discovery: input.executor_capability_discovery.cloned(),
                     },
                 )
                 .await;
             input
                 .turn_store
                 .insert(ExecutorSkillsStepState(catalog.clone()));
-            let include_usage = input
-                .thread_store
-                .get::<ModelInfo>()
+            let model_info = input.thread_store.get::<ModelInfo>();
+            let include_usage = model_info
+                .as_deref()
                 .is_some_and(|model_info| model_info.include_skills_usage_instructions);
-            vec![executor_skills_world_state_section(
+            let context_window = model_info
+                .as_deref()
+                .and_then(ModelInfo::resolved_context_window);
+            let metadata_budget = capped_skill_metadata_budget(context_window);
+            let mut sections = vec![executor_skills_world_state_section(
                 &catalog,
                 config.include_instructions,
                 include_usage,
-            )]
+                metadata_budget,
+            )];
+            if let Some(host_snapshot) = input.turn_store.get::<HostSkillsSnapshot>()
+                && self.providers.has_host_provider()
+            {
+                input.turn_store.insert(HostSkillsCatalogInWorldState);
+                sections.push(host_skills_world_state_section(
+                    &host_snapshot,
+                    config.include_instructions,
+                    include_usage,
+                    metadata_budget,
+                ));
+            }
+            sections
         })
     }
 }
@@ -199,9 +242,38 @@ where
 
         skill_tools(
             self.providers.clone(),
-            session_store.get::<McpResourceClient>(),
+            session_store
+                .get::<SkillsSessionState>()
+                .and_then(|state| state.mcp_resources.clone()),
             thread_state,
+            Arc::clone(&self.shadow_selection),
         )
+    }
+}
+
+impl<C> SkillInvocationContributor for SkillsExtension<C>
+where
+    C: Send + Sync + 'static,
+{
+    fn on_skill_invocation<'a>(
+        &'a self,
+        input: SkillInvocationInput<'a>,
+    ) -> ExtensionFuture<'a, ()> {
+        Box::pin(async move {
+            match input.kind {
+                SkillInvocationKind::Implicit => {
+                    if let Some(state) = input
+                        .thread_store
+                        .get::<SkillsThreadState>()
+                        .and_then(|state| state.shadow_selection_turn(input.turn_id))
+                    {
+                        self.shadow_selection
+                            .record_invocation(&state, input.skill_resource);
+                    }
+                }
+                SkillInvocationKind::Explicit => {}
+            }
+        })
     }
 }
 
@@ -222,36 +294,70 @@ where
             };
 
             let config = thread_state.config();
+            let mcp_resources = session_store
+                .get::<SkillsSessionState>()
+                .and_then(|state| state.mcp_resources.clone());
             let host_snapshot = turn_store.get::<HostSkillsSnapshot>();
+            let host_catalog_in_world_state =
+                turn_store.get::<HostSkillsCatalogInWorldState>().is_some();
             let query = SkillListQuery {
                 turn_id: input.turn_id.clone(),
                 executor_roots: Vec::new(),
                 host_snapshot: host_snapshot.clone(),
-                include_host_skills: true,
+                include_host_skills: !host_catalog_in_world_state,
                 include_bundled_skills: config.bundled_skills_enabled,
                 include_orchestrator_skills: thread_state.orchestrator_skills_enabled(),
-                mcp_resources: session_store.get::<McpResourceClient>(),
+                mcp_resources: mcp_resources.clone(),
+                executor_capability_discovery: None,
             };
-            let mut catalog = self.list_skills(query, &thread_state).await;
-            if let Some(executor_skills) = turn_store.get::<ExecutorSkillsStepState>() {
-                catalog.extend(executor_skills.0.clone());
-            }
+            let host_query = query.clone();
+            let mut catalog = turn_store
+                .get::<ExecutorSkillsStepState>()
+                .map(|executor_skills| executor_skills.0.clone())
+                .unwrap_or_default();
+            catalog.extend(self.list_skills(query, &thread_state).await);
             for warning in &catalog.warnings {
                 self.emit_warning(&input.turn_id, warning.clone());
             }
 
             let selected_entries = collect_explicit_skill_mentions(&input.user_input, &catalog);
+            let shadow_selection_turn = if config.shadow_selection_enabled {
+                let mut shadow_catalog = catalog.clone();
+                if host_catalog_in_world_state && host_snapshot.is_some() {
+                    shadow_catalog.extend(self.providers.list_host_for_turn(host_query).await);
+                }
+                Some(
+                    self.shadow_selection
+                        .run(&input.user_input, &shadow_catalog),
+                )
+            } else {
+                None
+            };
+            thread_state
+                .replace_shadow_selection_turn(input.turn_id.clone(), shadow_selection_turn);
             let mut fragments: Vec<Box<dyn ContextualUserFragment + Send>> = Vec::new();
-            if config.include_instructions {
+            if config.include_instructions
+                && turn_store.get::<HostSkillsCatalogInWorldState>().is_none()
+            {
                 let mut turn_catalog = catalog.clone();
                 turn_catalog.entries.retain(|entry| {
                     entry.authority.kind != SkillSourceKind::Executor
                         && entry.authority.kind != SkillSourceKind::Orchestrator
                 });
-                let include_usage = thread_store
-                    .get::<ModelInfo>()
+                let model_info = thread_store.get::<ModelInfo>();
+                let include_usage = model_info
+                    .as_deref()
                     .is_some_and(|model_info| model_info.include_skills_usage_instructions);
-                if let Some(fragment) = available_skills_fragment(&turn_catalog, include_usage) {
+                let context_window = model_info
+                    .as_deref()
+                    .and_then(ModelInfo::resolved_context_window);
+                let metadata_budget = capped_skill_metadata_budget(context_window);
+                if let Some(fragment) = available_skills_fragment(
+                    &turn_catalog,
+                    include_usage,
+                    SkillCatalogRenderPolicy::ExtensionCompatible,
+                    metadata_budget,
+                ) {
                     fragments.push(Box::new(fragment));
                 }
             }
@@ -261,7 +367,12 @@ where
             let mut injected_host_skill_prompts = InjectedHostSkillPrompts::default();
             for entry in &selected_entries {
                 match self
-                    .read_main_prompt(entry, host_snapshot.clone(), session_store, &thread_state)
+                    .read_main_prompt(
+                        entry,
+                        host_snapshot.clone(),
+                        mcp_resources.clone(),
+                        &thread_state,
+                    )
                     .await
                 {
                     Ok(read_result) => {
@@ -361,7 +472,7 @@ impl<C> SkillsExtension<C> {
         &self,
         entry: &SkillCatalogEntry,
         host_snapshot: Option<Arc<HostSkillsSnapshot>>,
-        session_store: &ExtensionData,
+        mcp_resources: Option<Arc<McpResourceClient>>,
         thread_state: &SkillsThreadState,
     ) -> Result<SkillReadResult, String> {
         thread_state
@@ -372,7 +483,7 @@ impl<C> SkillsExtension<C> {
                     package: entry.id.clone(),
                     resource: entry.main_prompt.clone(),
                     host_snapshot,
-                    mcp_resources: session_store.get::<McpResourceClient>(),
+                    mcp_resources,
                 },
             )
             .await
@@ -407,14 +518,32 @@ pub fn install_with_providers<C>(
 ) where
     C: Send + Sync + 'static,
 {
+    install_with_providers_and_metrics(
+        registry,
+        providers,
+        /*metrics_client*/ None,
+        config_from_host,
+    );
+}
+
+pub fn install_with_providers_and_metrics<C>(
+    registry: &mut ExtensionRegistryBuilder<C>,
+    providers: SkillProviders,
+    metrics_client: Option<MetricsClient>,
+    config_from_host: impl Fn(&C) -> SkillsExtensionConfig + Send + Sync + 'static,
+) where
+    C: Send + Sync + 'static,
+{
     let extension = Arc::new(SkillsExtension {
         providers,
         event_sink: registry.event_sink(),
         config_from_host: Arc::new(config_from_host),
+        shadow_selection: Arc::new(ShadowSelectionExperiment::new(metrics_client)),
     });
     registry.thread_lifecycle_contributor(extension.clone());
     registry.config_contributor(extension.clone());
     registry.prompt_contributor(extension.clone());
     registry.turn_input_contributor(extension.clone());
+    registry.skill_invocation_contributor(extension.clone());
     registry.tool_contributor(extension);
 }

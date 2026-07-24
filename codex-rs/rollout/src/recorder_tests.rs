@@ -178,6 +178,8 @@ async fn state_db_init_backfills_before_returning() -> anyhow::Result<()> {
             selected_capability_roots: Vec::new(),
             memory_mode: None,
             history_mode: Default::default(),
+            history_base: None,
+            subagent_history_start_ordinal: None,
             multi_agent_version: None,
             context_window: None,
         },
@@ -830,6 +832,46 @@ async fn paginated_ordinal_overflow_fails_without_appending() -> std::io::Result
 }
 
 #[tokio::test]
+async fn resumed_paginated_subagent_rollout_rejects_incomplete_prefix() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    let rollout_path = home.path().join("rollout.jsonl");
+    let thread_id = ThreadId::new();
+    let mut session_meta = paginated_session_meta_item(thread_id, home.path());
+    let RolloutItem::SessionMeta(meta_line) = &mut session_meta else {
+        panic!("fixture should be session metadata");
+    };
+    meta_line.meta.subagent_history_start_ordinal = Some(3);
+    let lines = [
+        RolloutLine {
+            timestamp: "2026-07-09T00:00:00Z".to_string(),
+            ordinal: Some(0),
+            item: session_meta,
+        },
+        RolloutLine {
+            timestamp: "2026-07-09T00:00:01Z".to_string(),
+            ordinal: Some(1),
+            item: agent_message_item("partial inherited prefix"),
+        },
+    ];
+    let jsonl = lines
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>()?
+        .join("\n");
+    fs::write(&rollout_path, format!("{jsonl}\n"))?;
+
+    let err = match RolloutRecorder::new(&config, RolloutRecorderParams::resume(rollout_path)).await
+    {
+        Ok(_) => panic!("incomplete prefix should fail resume"),
+        Err(err) => err,
+    };
+
+    assert!(err.to_string().contains("incomplete"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn append_rollout_item_to_path_assigns_next_paginated_ordinal() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
     let rollout_path = home.path().join("rollout.jsonl");
@@ -1290,6 +1332,7 @@ fn fill_missing_thread_item_metadata_preserves_identity_and_prefers_state_git_fi
         thread_id: Some(filesystem_thread_id),
         first_user_message: Some("filesystem message".to_string()),
         preview: Some("filesystem preview".to_string()),
+        is_pinned: false,
         cwd: None,
         git_branch: Some("filesystem-branch".to_string()),
         git_sha: Some("filesystem-sha".to_string()),
@@ -1310,6 +1353,7 @@ fn fill_missing_thread_item_metadata_preserves_identity_and_prefers_state_git_fi
         thread_id: Some(state_thread_id),
         first_user_message: Some("state message".to_string()),
         preview: Some("state preview".to_string()),
+        is_pinned: true,
         cwd: Some(PathBuf::from("/tmp/state-cwd")),
         git_branch: Some("state-branch".to_string()),
         git_sha: Some("state-sha".to_string()),
@@ -1330,6 +1374,7 @@ fn fill_missing_thread_item_metadata_preserves_identity_and_prefers_state_git_fi
 
     assert_eq!(item.path, filesystem_path);
     assert_eq!(item.thread_id, Some(filesystem_thread_id));
+    assert!(item.is_pinned);
     assert_eq!(
         item.first_user_message.as_deref(),
         Some("filesystem message")

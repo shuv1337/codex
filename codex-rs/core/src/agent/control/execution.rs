@@ -53,7 +53,6 @@ impl AgentControl {
             version
         } else if let Some(codex_thread) = thread.as_codex_thread() {
             codex_thread
-                .codex
                 .session
                 .get_config()
                 .await

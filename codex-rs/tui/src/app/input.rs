@@ -31,9 +31,7 @@ impl App {
 
         let seed = self.chat_widget.composer_text_with_pending();
         let editor_result = tui
-            .with_restored(tui::RestoreMode::KeepRaw, || async {
-                external_editor::run_editor(&seed, &editor_cmd).await
-            })
+            .with_restored(|| async { external_editor::run_editor(&seed, &editor_cmd).await })
             .await;
         self.reset_external_editor_state(tui);
 
@@ -233,7 +231,8 @@ impl App {
                 && self.chat_widget.composer_is_empty() =>
             {
                 if let Some(selection) = self.confirm_backtrack_from_main() {
-                    self.apply_backtrack_selection(tui, selection);
+                    self.apply_backtrack_selection(selection);
+                    tui.frame_requester().schedule_frame();
                 }
             }
             KeyEvent {

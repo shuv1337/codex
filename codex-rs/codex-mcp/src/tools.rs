@@ -19,9 +19,6 @@ use tracing::warn;
 
 use crate::mcp::sanitize_responses_api_tool_name;
 
-pub(crate) const MCP_TOOLS_CACHE_WRITE_DURATION_METRIC: &str =
-    "codex.mcp.tools.cache_write.duration_ms";
-
 const LEGACY_MCP_TOOL_NAME_PREFIX: &str = "mcp__";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,10 +109,11 @@ pub(crate) fn filter_tools(tools: Vec<ToolInfo>, filter: &ToolFilter) -> Vec<Too
 /// every model-visible name is unique and <= 64 bytes.
 ///
 /// When `prefix_mcp_tool_names` is true, the historical `mcp__` namespace
-/// prefix is added without restoring the old trailing `__` namespace suffix.
+/// prefix is added except for tools from `non_prefixed_mcp_tool_servers`.
 pub(crate) fn normalize_tools_for_model_with_prefix<I>(
     tools: I,
     prefix_mcp_tool_names: bool,
+    non_prefixed_mcp_tool_servers: &[String],
 ) -> Vec<ToolInfo>
 where
     I: IntoIterator<Item = ToolInfo>,
@@ -140,7 +138,7 @@ where
 
         let callable_namespace = callable_namespace_with_prefix(
             &sanitize_responses_api_tool_name(&tool.callable_namespace),
-            prefix_mcp_tool_names,
+            prefix_mcp_tool_names && !non_prefixed_mcp_tool_servers.contains(&tool.server_name),
         );
 
         candidates.push(CallableToolCandidate {

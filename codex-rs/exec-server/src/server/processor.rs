@@ -10,6 +10,7 @@ use crate::ExecServerRuntimePaths;
 use crate::connection::CHANNEL_CAPACITY;
 use crate::connection::JsonRpcConnection;
 use crate::connection::JsonRpcConnectionEvent;
+use crate::rpc::RpcCallError;
 use crate::rpc::RpcNotificationSender;
 use crate::rpc::RpcServerOutboundMessage;
 use crate::rpc::encode_server_message;
@@ -84,6 +85,7 @@ async fn run_connection(
     let (outgoing_tx, mut outgoing_rx) =
         mpsc::channel::<RpcServerOutboundMessage>(CHANNEL_CAPACITY);
     let notifications = RpcNotificationSender::new(outgoing_tx.clone());
+    let requests = notifications.request_sender();
     let handler = Arc::new(ExecServerHandler::new(
         session_registry,
         notifications,
@@ -208,18 +210,23 @@ async fn run_connection(
                     }
                 }
                 codex_exec_server_protocol::JSONRPCMessage::Response(response) => {
-                    warn!(
-                        "closing exec-server connection after unexpected client response: {:?}",
-                        response.id
-                    );
-                    break;
+                    if !requests.complete(response.id.clone(), Ok(response.result)) {
+                        warn!(
+                            "closing exec-server connection after unexpected client response: {:?}",
+                            response.id
+                        );
+                        break;
+                    }
                 }
                 codex_exec_server_protocol::JSONRPCMessage::Error(error) => {
-                    warn!(
-                        "closing exec-server connection after unexpected client error: {:?}",
-                        error.id
-                    );
-                    break;
+                    if !requests.complete(error.id.clone(), Err(RpcCallError::Server(error.error)))
+                    {
+                        warn!(
+                            "closing exec-server connection after unexpected client error: {:?}",
+                            error.id
+                        );
+                        break;
+                    }
                 }
             },
             JsonRpcConnectionEvent::Disconnected { reason } => {
@@ -231,8 +238,10 @@ async fn run_connection(
         }
     }
 
+    requests.close();
     handler.shutdown().await;
     drop(handler);
+    drop(requests);
     drop(outgoing_tx);
     for task in connection_tasks {
         task.abort();
@@ -265,7 +274,9 @@ fn request_result(message: &Option<RpcServerOutboundMessage>) -> &'static str {
     match message {
         Some(RpcServerOutboundMessage::Error { .. }) => "error",
         Some(
-            RpcServerOutboundMessage::Response { .. } | RpcServerOutboundMessage::Notification(_),
+            RpcServerOutboundMessage::Request(_)
+            | RpcServerOutboundMessage::Response { .. }
+            | RpcServerOutboundMessage::Notification(_),
         )
         | None => "success",
     }
@@ -308,10 +319,13 @@ mod tests {
     use crate::ProcessId;
     use crate::connection::JsonRpcConnection;
     use crate::protocol::ENVIRONMENT_INFO_METHOD;
+    use crate::protocol::ENVIRONMENT_STATUS_METHOD;
     use crate::protocol::EXEC_METHOD;
     use crate::protocol::EXEC_READ_METHOD;
     use crate::protocol::EXEC_TERMINATE_METHOD;
     use crate::protocol::EnvironmentInfo;
+    use crate::protocol::EnvironmentStatus;
+    use crate::protocol::EnvironmentStatusKind;
     use crate::protocol::ExecParams;
     use crate::protocol::ExecResponse;
     use crate::protocol::INITIALIZE_METHOD;
@@ -394,9 +408,16 @@ mod tests {
 
         send_request(&mut writer, /*id*/ 2, ENVIRONMENT_INFO_METHOD, &()).await;
         send_request(&mut writer, /*id*/ 3, ENVIRONMENT_INFO_METHOD, &()).await;
+        send_request(&mut writer, /*id*/ 4, ENVIRONMENT_STATUS_METHOD, &()).await;
 
         let _: EnvironmentInfo = read_response(&mut lines, /*expected_id*/ 2).await;
         let _: EnvironmentInfo = read_response(&mut lines, /*expected_id*/ 3).await;
+        assert_eq!(
+            read_response::<EnvironmentStatus>(&mut lines, /*expected_id*/ 4).await,
+            EnvironmentStatus {
+                status: EnvironmentStatusKind::Ready,
+            }
+        );
 
         drop(writer);
         drop(lines);
@@ -594,6 +615,7 @@ mod tests {
             sandbox: None,
             enforce_managed_network: false,
             managed_network: None,
+            network_proxy: None,
         }
     }
 

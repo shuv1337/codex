@@ -11,8 +11,10 @@ use chrono::Utc;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::ThreadHistoryMode;
 pub use codex_state::LogEntry;
 use codex_state::ThreadMetadataBuilder;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path::normalize_for_path_comparison;
 use serde_json::Value;
 use std::path::Path;
@@ -215,7 +217,8 @@ fn emit_startup_warning(message: &str) {
 /// Unlike [`init`], this helper does not run rollout backfill. It is for
 /// optional local reads from non-owning contexts such as remote app-server mode.
 pub async fn get_state_db(config: &impl RolloutConfigView) -> Option<StateDbHandle> {
-    let state_path = codex_state::state_db_path(config.sqlite_home());
+    let sqlite_home = AbsolutePathBuf::try_from(config.sqlite_home()).ok()?;
+    let state_path = codex_state::SqliteConfig::from_sqlite_home(sqlite_home).state_db_path();
     if !tokio::fs::try_exists(&state_path).await.unwrap_or(false) {
         codex_state::record_fallback(
             "get_state_db",
@@ -369,6 +372,7 @@ pub async fn list_threads_db(
     cwd_filters: Option<&[PathBuf]>,
     relation_filter: Option<codex_state::ThreadRelationFilter>,
     archived: bool,
+    is_pinned: Option<bool>,
     search_term: Option<&str>,
 ) -> Option<codex_state::ThreadsPage> {
     let ctx = context?;
@@ -398,6 +402,7 @@ pub async fn list_threads_db(
     });
     let filters = codex_state::ThreadFilterOptions {
         archived_only: archived,
+        is_pinned,
         allowed_sources: allowed_sources.as_slice(),
         model_providers: model_providers.as_deref(),
         cwd_filters: normalized_cwd_filters.as_deref(),
@@ -528,9 +533,14 @@ pub async fn reconcile_rollout(
     let mut metadata = outcome.metadata;
     let memory_mode = outcome.memory_mode.unwrap_or_else(|| "enabled".to_string());
     metadata.cwd = normalize_cwd_for_state_db(&metadata.cwd);
-    if let Ok(Some(existing_metadata)) = ctx.get_thread(metadata.id).await {
-        metadata.prefer_existing_git_info(&existing_metadata);
-        metadata.prefer_existing_explicit_title(&existing_metadata);
+    let existing_metadata = ctx.get_thread(metadata.id).await.ok().flatten();
+    // Paginated metadata updates are SQLite-only. Use the rollout mode to seed a
+    // missing row, then keep the value from SQLite.
+    let restore_memory_mode_from_rollout =
+        existing_metadata.is_none() || matches!(metadata.history_mode, ThreadHistoryMode::Legacy);
+    if let Some(existing_metadata) = existing_metadata.as_ref() {
+        metadata.prefer_existing_git_info(existing_metadata);
+        metadata.prefer_existing_explicit_title(existing_metadata);
     }
     match archived_only {
         Some(true) if metadata.archived_at.is_none() => {
@@ -548,9 +558,10 @@ pub async fn reconcile_rollout(
         );
         return;
     }
-    if let Err(err) = ctx
-        .set_thread_memory_mode(metadata.id, memory_mode.as_str())
-        .await
+    if restore_memory_mode_from_rollout
+        && let Err(err) = ctx
+            .set_thread_memory_mode(metadata.id, memory_mode.as_str())
+            .await
     {
         warn!(
             "state db reconcile_rollout memory_mode update failed {}: {err}",
